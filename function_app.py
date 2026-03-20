@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import smtplib
+import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
@@ -196,11 +197,18 @@ def sum_items(items: list[dict[str, Any]]) -> dict[str, float]:
     }
 
 
-def calculate_change(current_value: float, previous_value: float) -> dict[str, float | None]:
+def calculate_change(current_value: float | None, previous_value: float | None) -> dict[str, float | None]:
+    if current_value is None or previous_value is None:
+        return {
+            "difference": None,
+            "rate_percent": None
+        }
+
     diff = current_value - previous_value
     rate = None
     if previous_value != 0:
         rate = (diff / previous_value) * 100
+
     return {
         "difference": diff,
         "rate_percent": rate
@@ -293,64 +301,86 @@ def fetch_day_costs(
         }
     }
 
-    response = requests.post(
-        url,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"
-        },
-        json=body,
-        timeout=60
-    )
+    retry_delays = [60, 300, 600]
+    last_response = None
 
-    if response.status_code != 200:
-        raise RuntimeError(f"Cost API 호출 실패: {response.status_code} / {response.text}")
+    for attempt in range(len(retry_delays) + 1):
+        response = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            },
+            json=body,
+            timeout=60
+        )
 
-    data = response.json()
-    properties = data.get("properties", {})
-    rows = properties.get("rows", [])
-    columns = properties.get("columns", [])
+        if response.status_code == 200:
+            data = response.json()
+            properties = data.get("properties", {})
+            rows = properties.get("rows", [])
+            columns = properties.get("columns", [])
 
-    col_index = {}
-    for idx, col in enumerate(columns):
-        col_index[col.get("name")] = idx
+            col_index = {}
+            for idx, col in enumerate(columns):
+                col_index[col.get("name")] = idx
 
-    resource_id_idx = col_index.get("ResourceId")
-    total_cost_idx = col_index.get("totalCost")
-    currency_idx = col_index.get("Currency")
-    usage_date_idx = col_index.get("UsageDate")
+            resource_id_idx = col_index.get("ResourceId")
+            total_cost_idx = col_index.get("totalCost")
+            currency_idx = col_index.get("Currency")
+            usage_date_idx = col_index.get("UsageDate")
 
-    resource_costs = []
-    total_cost = 0
-    currency = None
+            resource_costs = []
+            total_cost = 0
+            currency = None
 
-    normalized_resource_ids = {x.lower(): x for x in resource_ids}
+            normalized_resource_ids = {x.lower(): x for x in resource_ids}
 
-    for row in rows:
-        row_resource_id = str(row[resource_id_idx]).lower() if resource_id_idx is not None else ""
-        if row_resource_id not in normalized_resource_ids:
+            for row in rows:
+                row_resource_id = str(row[resource_id_idx]).lower() if resource_id_idx is not None else ""
+                if row_resource_id not in normalized_resource_ids:
+                    continue
+
+                cost_value = float(row[total_cost_idx]) if total_cost_idx is not None else 0.0
+                currency = row[currency_idx] if currency_idx is not None else currency
+
+                resource_costs.append({
+                    "resource_id": normalized_resource_ids[row_resource_id],
+                    "usage_date": str(row[usage_date_idx]) if usage_date_idx is not None else target_date_kst,
+                    "cost": cost_value,
+                    "currency": currency
+                })
+
+                total_cost += cost_value
+
+            return {
+                "target_date_kst": target_date_kst,
+                "start_time_utc": start_utc.isoformat(),
+                "end_time_utc": end_utc.isoformat(),
+                "currency": currency,
+                "total_cost": total_cost,
+                "resource_costs": resource_costs,
+                "cost_data_available": True
+            }
+
+        last_response = response
+
+        if response.status_code == 429 and attempt < len(retry_delays):
+            delay = retry_delays[attempt]
+            logging.warning(
+                "Cost API throttled (429). retry=%s/%s wait=%ss",
+                attempt + 1,
+                len(retry_delays),
+                delay
+            )
+            time.sleep(delay)
             continue
 
-        cost_value = float(row[total_cost_idx]) if total_cost_idx is not None else 0.0
-        currency = row[currency_idx] if currency_idx is not None else currency
+        break
 
-        resource_costs.append({
-            "resource_id": normalized_resource_ids[row_resource_id],
-            "usage_date": str(row[usage_date_idx]) if usage_date_idx is not None else target_date_kst,
-            "cost": cost_value,
-            "currency": currency
-        })
-
-        total_cost += cost_value
-
-    return {
-        "target_date_kst": target_date_kst,
-        "start_time_utc": start_utc.isoformat(),
-        "end_time_utc": end_utc.isoformat(),
-        "currency": currency,
-        "total_cost": total_cost,
-        "resource_costs": resource_costs
-    }
+    raise RuntimeError(
+        f"Cost API 호출 실패: {last_response.status_code} / {last_response.text}"
+    )
 
 
 def build_daily_compare_data() -> dict[str, Any]:
@@ -363,8 +393,41 @@ def build_daily_compare_data() -> dict[str, Any]:
     d5_metrics = fetch_day_metrics(credential, resources, days_ago=5)
     d4_metrics = fetch_day_metrics(credential, resources, days_ago=4)
 
-    d5_costs = fetch_day_costs(credential, subscription_id, resource_ids, days_ago=5)
-    d4_costs = fetch_day_costs(credential, subscription_id, resource_ids, days_ago=4)
+    cost_error = None
+
+    try:
+        d5_costs = fetch_day_costs(credential, subscription_id, resource_ids, days_ago=5)
+        d4_costs = fetch_day_costs(credential, subscription_id, resource_ids, days_ago=4)
+        cost_change = calculate_change(
+            d4_costs["total_cost"],
+            d5_costs["total_cost"]
+        )
+    except Exception as e:
+        logging.exception("Cost data fetch failed")
+        cost_error = str(e)
+
+        d5_costs = {
+            "target_date_kst": d5_metrics["target_date_kst"],
+            "start_time_utc": d5_metrics["start_time_utc"],
+            "end_time_utc": d5_metrics["end_time_utc"],
+            "currency": None,
+            "total_cost": None,
+            "resource_costs": [],
+            "cost_data_available": False
+        }
+        d4_costs = {
+            "target_date_kst": d4_metrics["target_date_kst"],
+            "start_time_utc": d4_metrics["start_time_utc"],
+            "end_time_utc": d4_metrics["end_time_utc"],
+            "currency": None,
+            "total_cost": None,
+            "resource_costs": [],
+            "cost_data_available": False
+        }
+        cost_change = {
+            "difference": None,
+            "rate_percent": None
+        }
 
     token_change = {
         "prompt_tokens": calculate_change(
@@ -378,14 +441,10 @@ def build_daily_compare_data() -> dict[str, Any]:
         ),
     }
 
-    cost_change = calculate_change(
-        d4_costs["total_cost"],
-        d5_costs["total_cost"]
-    )
-
     return {
         "timezone": "KST",
         "resource_count": len(resources),
+        "cost_error": cost_error,
         "comparison": {
             "previous_day": {
                 "date_kst": d5_metrics["target_date_kst"],
@@ -430,9 +489,10 @@ def generate_report_text(compare_data: dict[str, Any]) -> str:
 2. 값이 0이거나 변화가 없으면 '변동이 없습니다'처럼 담백하게 쓴다.
 3. 5문장 이내로 작성한다.
 4. 날짜는 KST 기준이라고 자연스럽게 반영한다.
-5. 금액 단위는 원으로 표기하되, 값이 없으면 비용 집계가 없다고 쓴다.
+5. 금액 단위는 원으로 표기하되, 값이 없으면 비용 데이터 조회에 실패했다고 쓴다.
 6. 토큰은 input/output/total 순서로 언급하면 좋다.
 7. 모델명이 비어 있으면 모델명 언급 없이 전체 사용량 기준으로 쓴다.
+8. cost_data_available가 false이거나 cost_error가 있으면, 비용 데이터는 일시적으로 조회되지 않았다고 안내하고 토큰 사용량 중심으로 리포트를 작성한다.
 """
 
     user_prompt = f"""
@@ -470,6 +530,32 @@ def build_email_html(report_text: str, compare_data: dict[str, Any]) -> str:
     cost_change = compare_data["comparison"]["summary_change"]["cost"]
 
     currency = curr_day["costs"].get("currency") or prev_day["costs"].get("currency") or "KRW"
+
+    if curr_day["costs"].get("cost_data_available") is False:
+        cost_section = """
+        <h3>비용 요약</h3>
+        <p>비용 데이터는 일시적으로 조회되지 않아 이번 리포트에는 포함되지 않았습니다.</p>
+        """
+    else:
+        cost_section = f"""
+        <h3>비용 요약</h3>
+        <table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse;">
+          <tr>
+            <th>항목</th>
+            <th>{prev_day["date_kst"]}</th>
+            <th>{curr_day["date_kst"]}</th>
+            <th>증감</th>
+            <th>증감률</th>
+          </tr>
+          <tr>
+            <td>Total Cost ({currency})</td>
+            <td>{format_number(prev_day["costs"]["total_cost"])}</td>
+            <td>{format_number(curr_day["costs"]["total_cost"])}</td>
+            <td>{format_number(cost_change["difference"])}</td>
+            <td>{format_number(cost_change["rate_percent"])}%</td>
+          </tr>
+        </table>
+        """
 
     html = f"""
     <html>
@@ -512,23 +598,7 @@ def build_email_html(report_text: str, compare_data: dict[str, Any]) -> str:
           </tr>
         </table>
 
-        <h3>비용 요약</h3>
-        <table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse;">
-          <tr>
-            <th>항목</th>
-            <th>{prev_day["date_kst"]}</th>
-            <th>{curr_day["date_kst"]}</th>
-            <th>증감</th>
-            <th>증감률</th>
-          </tr>
-          <tr>
-            <td>Total Cost ({currency})</td>
-            <td>{format_number(prev_day["costs"]["total_cost"])}</td>
-            <td>{format_number(curr_day["costs"]["total_cost"])}</td>
-            <td>{format_number(cost_change["difference"])}</td>
-            <td>{format_number(cost_change["rate_percent"])}%</td>
-          </tr>
-        </table>
+        {cost_section}
 
         <p style="margin-top: 24px; color: #666; font-size: 12px;">
           This report was generated by AOAI FinOps Sentinel.
@@ -666,3 +736,4 @@ def daily_report_timer(mytimer: func.TimerRequest) -> None:
     except Exception:
         logging.exception("daily_report_timer failed")
         raise
+    
