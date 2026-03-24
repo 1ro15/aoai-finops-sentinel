@@ -12,7 +12,6 @@ from typing import Any
 import azure.functions as func
 import requests
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
-from azure.monitor.querymetrics import MetricsClient, MetricAggregationType
 from openai import AzureOpenAI
 
 app = func.FunctionApp()
@@ -30,16 +29,6 @@ def get_env(name: str) -> str:
     return value
 
 
-def safe_attr(obj: Any, attr_name: str, default: str = "") -> str:
-    try:
-        value = getattr(obj, attr_name, None)
-        if value is None:
-            return default
-        return str(value)
-    except Exception:
-        return default
-
-
 def format_number(value: float | int | None) -> str:
     if value is None:
         return "-"
@@ -50,20 +39,23 @@ def format_number(value: float | int | None) -> str:
 
 def calculate_change(current_value: float | None, previous_value: float | None) -> dict[str, float | None]:
     if current_value is None or previous_value is None:
-        return {
-            "difference": None,
-            "rate_percent": None
-        }
+        return {"difference": None, "rate_percent": None}
 
     diff = current_value - previous_value
     rate = None
     if previous_value != 0:
         rate = (diff / previous_value) * 100
 
-    return {
-        "difference": diff,
-        "rate_percent": rate
-    }
+    return {"difference": diff, "rate_percent": rate}
+
+
+def normalize_dimension_value(value: str | None, fallback: str = "unknown") -> str:
+    if value is None:
+        return fallback
+    value = str(value).strip()
+    if not value:
+        return fallback
+    return value
 
 
 def get_kst_day_range_to_utc(days_ago: int) -> tuple[datetime, datetime, str]:
@@ -77,32 +69,6 @@ def get_kst_day_range_to_utc(days_ago: int) -> tuple[datetime, datetime, str]:
     end_utc = end_kst.astimezone(timezone.utc)
 
     return start_utc, end_utc, str(target_date_kst)
-
-
-def parse_dimension_map(metadata_values: list[Any]) -> dict[str, str]:
-    result: dict[str, str] = {}
-
-    for item in metadata_values or []:
-        name = safe_attr(item, "name")
-        value = safe_attr(item, "value")
-
-        if not name and isinstance(item, dict):
-            name = str(item.get("name", ""))
-            value = str(item.get("value", ""))
-
-        if name:
-            result[name] = value
-
-    return result
-
-
-def normalize_dimension_value(value: str | None, fallback: str = "unknown") -> str:
-    if value is None:
-        return fallback
-    value = str(value).strip()
-    if not value:
-        return fallback
-    return value
 
 
 # -----------------------------
@@ -136,13 +102,138 @@ def load_resources() -> list[dict[str, str]]:
     return normalized
 
 
-def get_metrics_endpoint(region: str) -> str:
-    return f"https://{region}.metrics.monitor.azure.com"
+# -----------------------------
+# Metrics REST API 기반 조회
+# Azure Monitor metrics split: ModelDeploymentName eq '*'
+# -----------------------------
+def get_azure_management_token(credential: DefaultAzureCredential) -> str:
+    return credential.get_token("https://management.azure.com/.default").token
 
 
-# -----------------------------
-# 메트릭 조회
-# -----------------------------
+def extract_metadata_values(ts: dict[str, Any]) -> dict[str, str]:
+    result = {}
+    for item in ts.get("metadatavalues", []) or []:
+        name = (((item.get("name") or {}).get("value")) or "").strip()
+        value = str(item.get("value", "")).strip()
+        if name:
+            result[name] = value
+    return result
+
+
+def query_metric_split_by_deployment(
+    credential: DefaultAzureCredential,
+    resource_id: str,
+    metric_name: str,
+    start_time_utc: datetime,
+    end_time_utc: datetime,
+) -> list[dict[str, Any]]:
+    """
+    Azure Monitor Metrics REST API를 사용해
+    ModelDeploymentName 차원 기준으로 split 조회
+    """
+    token = get_azure_management_token(credential)
+
+    url = f"https://management.azure.com{resource_id}/providers/microsoft.insights/metrics"
+
+    params = {
+        "api-version": "2018-01-01",
+        "metricnames": metric_name,
+        "timespan": f"{start_time_utc.isoformat()}/{end_time_utc.isoformat()}",
+        "interval": "P1D",
+        "aggregation": "Total",
+        "filter": "ModelDeploymentName eq '*'",
+    }
+
+    response = requests.get(
+        url,
+        headers={"Authorization": f"Bearer {token}"},
+        params=params,
+        timeout=60,
+    )
+
+    if response.status_code != 200:
+        raise RuntimeError(f"Metrics API 호출 실패: {response.status_code} / {response.text}")
+
+    payload = response.json()
+    values = payload.get("value", []) or []
+    rows: list[dict[str, Any]] = []
+
+    for metric in values:
+        metric_name_value = (((metric.get("name") or {}).get("value")) or metric_name)
+        for ts in metric.get("timeseries", []) or []:
+            metadata = extract_metadata_values(ts)
+
+            total_value = 0
+            for point in ts.get("data", []) or []:
+                point_total = point.get("total")
+                if point_total is not None:
+                    total_value += point_total
+
+            deployment = normalize_dimension_value(
+                metadata.get("ModelDeploymentName"),
+                fallback="unknown"
+            )
+
+            model_name = normalize_dimension_value(
+                metadata.get("ModelName"),
+                fallback=deployment
+            )
+
+            model_version = normalize_dimension_value(
+                metadata.get("ModelVersion"),
+                fallback="-"
+            )
+
+            rows.append({
+                "metric_name": metric_name_value,
+                "model_deployment_name": deployment,
+                "model_name": model_name,
+                "model_version": model_version,
+                "raw_dimensions": metadata,
+                "total": total_value,
+            })
+
+    return rows
+
+
+def query_all_metrics_for_resource(
+    credential: DefaultAzureCredential,
+    resource: dict[str, str],
+    start_time_utc: datetime,
+    end_time_utc: datetime,
+) -> list[dict[str, Any]]:
+    metric_names = [
+        "ProcessedPromptTokens",
+        "GeneratedTokens",
+        "TokenTransaction",
+    ]
+
+    all_rows: list[dict[str, Any]] = []
+
+    for metric_name in metric_names:
+        metric_rows = query_metric_split_by_deployment(
+            credential=credential,
+            resource_id=resource["resource_id"],
+            metric_name=metric_name,
+            start_time_utc=start_time_utc,
+            end_time_utc=end_time_utc,
+        )
+
+        for row in metric_rows:
+            all_rows.append({
+                "resource_id": resource["resource_id"],
+                "region": resource["region"],
+                "metric_name": row["metric_name"],
+                "model_deployment_name": row["model_deployment_name"],
+                "model_name": row["model_name"],
+                "model_version": row["model_version"],
+                "raw_dimensions": row["raw_dimensions"],
+                "total": row["total"],
+            })
+
+    return all_rows
+
+
 def metric_name_to_field(metric_name: str) -> str:
     mapping = {
         "ProcessedPromptTokens": "prompt_tokens",
@@ -150,62 +241,6 @@ def metric_name_to_field(metric_name: str) -> str:
         "TokenTransaction": "total_tokens",
     }
     return mapping.get(metric_name, metric_name)
-
-
-def query_metrics_for_region(
-    credential: DefaultAzureCredential,
-    region: str,
-    resource_ids: list[str],
-    start_time_utc: datetime,
-    end_time_utc: datetime,
-) -> list[dict[str, Any]]:
-    endpoint = get_metrics_endpoint(region)
-    client = MetricsClient(endpoint, credential)
-
-    results = client.query_resources(
-        resource_ids=resource_ids,
-        metric_namespace="Microsoft.CognitiveServices/accounts",
-        metric_names=[
-            "ProcessedPromptTokens",
-            "GeneratedTokens",
-            "TokenTransaction",
-        ],
-        timespan=(start_time_utc, end_time_utc),
-        granularity=timedelta(days=1),
-        aggregations=[MetricAggregationType.TOTAL],
-    )
-
-    rows: list[dict[str, Any]] = []
-
-    for index, metrics_query_result in enumerate(results):
-        resource_id = resource_ids[index]
-
-        for metric in metrics_query_result.metrics:
-            metric_name = str(metric.name)
-
-            for ts in metric.timeseries:
-                dimension_map = parse_dimension_map(getattr(ts, "metadata_values", []))
-
-                total_value = 0
-                for point in ts.data:
-                    if getattr(point, "total", None) is not None:
-                        total_value += point.total
-
-                rows.append({
-                    "resource_id": resource_id,
-                    "region": region,
-                    "metric_name": metric_name,
-                    "model_deployment_name": normalize_dimension_value(dimension_map.get("ModelDeploymentName")),
-                    "model_name": normalize_dimension_value(dimension_map.get("ModelName")),
-                    "model_version": normalize_dimension_value(dimension_map.get("ModelVersion")),
-                    "api_name": normalize_dimension_value(dimension_map.get("ApiName")),
-                    "usage_channel": normalize_dimension_value(dimension_map.get("UsageChannel")),
-                    "feature_name": normalize_dimension_value(dimension_map.get("FeatureName")),
-                    "total": total_value,
-                    "raw_dimensions": dimension_map,
-                })
-
-    return rows
 
 
 def normalize_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -255,20 +290,16 @@ def fetch_day_metrics(
 ) -> dict[str, Any]:
     start_utc, end_utc, target_date_kst = get_kst_day_range_to_utc(days_ago)
 
-    region_to_resource_ids: dict[str, list[str]] = defaultdict(list)
-    for item in resources:
-        region_to_resource_ids[item["region"]].append(item["resource_id"])
-
     all_rows: list[dict[str, Any]] = []
-    for region, resource_ids in region_to_resource_ids.items():
-        region_rows = query_metrics_for_region(
+
+    for resource in resources:
+        rows = query_all_metrics_for_resource(
             credential=credential,
-            region=region,
-            resource_ids=resource_ids,
+            resource=resource,
             start_time_utc=start_utc,
             end_time_utc=end_utc,
         )
-        all_rows.extend(region_rows)
+        all_rows.extend(rows)
 
     normalized = normalize_rows(all_rows)
     summary = sum_items(normalized)
@@ -414,7 +445,7 @@ def build_model_key(item: dict[str, Any]) -> tuple:
         item.get("resource_id", "unknown"),
         item.get("region", "unknown"),
         item.get("model_name", "unknown"),
-        item.get("model_version", "unknown"),
+        item.get("model_version", "-"),
         item.get("model_deployment_name", "unknown"),
     )
 
@@ -928,4 +959,3 @@ def daily_report_timer(mytimer: func.TimerRequest) -> None:
     except Exception:
         logging.exception("daily_report_timer failed")
         raise
-    
