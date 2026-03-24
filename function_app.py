@@ -3,7 +3,6 @@ import logging
 import os
 import smtplib
 import time
-from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -104,7 +103,7 @@ def load_resources() -> list[dict[str, str]]:
 
 # -----------------------------
 # Metrics REST API 기반 조회
-# Azure Monitor metrics split: ModelDeploymentName eq '*'
+# 이번 버전은 filter 제거한 디버깅용 버전
 # -----------------------------
 def get_azure_management_token(credential: DefaultAzureCredential) -> str:
     return credential.get_token("https://management.azure.com/.default").token
@@ -128,8 +127,8 @@ def query_metric_split_by_deployment(
     end_time_utc: datetime,
 ) -> list[dict[str, Any]]:
     """
-    Azure Monitor Metrics REST API를 사용해
-    ModelDeploymentName 차원 기준으로 split 조회
+    Azure Monitor Metrics REST API 조회
+    현재는 원인 파악을 위해 filter를 제거한 상태
     """
     token = get_azure_management_token(credential)
 
@@ -141,7 +140,7 @@ def query_metric_split_by_deployment(
         "timespan": f"{start_time_utc.isoformat()}/{end_time_utc.isoformat()}",
         "interval": "P1D",
         "aggregation": "Total",
-        "filter": "ModelDeploymentName eq '*'",
+        # "filter": "ModelDeploymentName eq '*'",  # 디버깅을 위해 잠시 제거
     }
 
     response = requests.get(
@@ -297,7 +296,7 @@ def fetch_day_metrics(
             credential=credential,
             resource=resource,
             start_time_utc=start_utc,
-            end_time_utc=end_utc,
+            end_time_utc=end_time_utc,
         )
         all_rows.extend(rows)
 
@@ -307,7 +306,7 @@ def fetch_day_metrics(
     return {
         "target_date_kst": target_date_kst,
         "start_time_utc": start_utc.isoformat(),
-        "end_time_utc": end_utc.isoformat(),
+        "end_time_utc": end_time_utc.isoformat(),
         "items": normalized,
         "summary": summary,
     }
@@ -892,9 +891,9 @@ def daily_compare(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json",
             status_code=200
         )
-    except Exception:
+    except Exception as e:
         logging.exception("daily_compare failed")
-        return func.HttpResponse("daily_compare failed", status_code=500, mimetype="text/plain")
+        return func.HttpResponse(str(e), status_code=500, mimetype="text/plain")
 
 
 @app.route(route="daily_report_preview", methods=["GET"])
@@ -915,9 +914,9 @@ def daily_report_preview(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json",
             status_code=200
         )
-    except Exception:
+    except Exception as e:
         logging.exception("daily_report_preview failed")
-        return func.HttpResponse("daily_report_preview failed", status_code=500, mimetype="text/plain")
+        return func.HttpResponse(str(e), status_code=500, mimetype="text/plain")
 
 
 @app.route(route="daily_report_send", methods=["GET"])
@@ -929,9 +928,9 @@ def daily_report_send(req: func.HttpRequest) -> func.HttpResponse:
             mimetype="application/json",
             status_code=200
         )
-    except Exception:
+    except Exception as e:
         logging.exception("daily_report_send failed")
-        return func.HttpResponse("daily_report_send failed", status_code=500, mimetype="text/plain")
+        return func.HttpResponse(str(e), status_code=500, mimetype="text/plain")
 
 
 @app.function_name(name="daily_report_timer")
