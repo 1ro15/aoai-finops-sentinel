@@ -20,6 +20,9 @@ app = func.FunctionApp()
 KST = timezone(timedelta(hours=9))
 
 
+# -----------------------------
+# 공통 유틸
+# -----------------------------
 def get_env(name: str) -> str:
     value = os.getenv(name)
     if not value:
@@ -27,6 +30,84 @@ def get_env(name: str) -> str:
     return value
 
 
+def safe_attr(obj: Any, attr_name: str, default: str = "") -> str:
+    try:
+        value = getattr(obj, attr_name, None)
+        if value is None:
+            return default
+        return str(value)
+    except Exception:
+        return default
+
+
+def format_number(value: float | int | None) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, float):
+        return f"{value:,.2f}"
+    return f"{value:,}"
+
+
+def calculate_change(current_value: float | None, previous_value: float | None) -> dict[str, float | None]:
+    if current_value is None or previous_value is None:
+        return {
+            "difference": None,
+            "rate_percent": None
+        }
+
+    diff = current_value - previous_value
+    rate = None
+    if previous_value != 0:
+        rate = (diff / previous_value) * 100
+
+    return {
+        "difference": diff,
+        "rate_percent": rate
+    }
+
+
+def get_kst_day_range_to_utc(days_ago: int) -> tuple[datetime, datetime, str]:
+    now_kst = datetime.now(KST)
+    target_date_kst = (now_kst - timedelta(days=days_ago)).date()
+
+    start_kst = datetime.combine(target_date_kst, datetime.min.time(), tzinfo=KST)
+    end_kst = start_kst + timedelta(days=1)
+
+    start_utc = start_kst.astimezone(timezone.utc)
+    end_utc = end_kst.astimezone(timezone.utc)
+
+    return start_utc, end_utc, str(target_date_kst)
+
+
+def parse_dimension_map(metadata_values: list[Any]) -> dict[str, str]:
+    result: dict[str, str] = {}
+
+    for item in metadata_values or []:
+        name = safe_attr(item, "name")
+        value = safe_attr(item, "value")
+
+        if not name and isinstance(item, dict):
+            name = str(item.get("name", ""))
+            value = str(item.get("value", ""))
+
+        if name:
+            result[name] = value
+
+    return result
+
+
+def normalize_dimension_value(value: str | None, fallback: str = "unknown") -> str:
+    if value is None:
+        return fallback
+    value = str(value).strip()
+    if not value:
+        return fallback
+    return value
+
+
+# -----------------------------
+# 리소스 설정
+# -----------------------------
 def load_resources() -> list[dict[str, str]]:
     raw = get_env("AOAI_RESOURCE_IDS")
     resources = json.loads(raw)
@@ -59,33 +140,9 @@ def get_metrics_endpoint(region: str) -> str:
     return f"https://{region}.metrics.monitor.azure.com"
 
 
-def safe_attr(obj: Any, attr_name: str, default: str = "") -> str:
-    try:
-        value = getattr(obj, attr_name, None)
-        if value is None:
-            return default
-        return str(value)
-    except Exception:
-        return default
-
-
-def parse_dimension_map(metadata_values: list[Any]) -> dict[str, str]:
-    result: dict[str, str] = {}
-
-    for item in metadata_values or []:
-        name = safe_attr(item, "name")
-        value = safe_attr(item, "value")
-
-        if not name and isinstance(item, dict):
-            name = str(item.get("name", ""))
-            value = str(item.get("value", ""))
-
-        if name:
-            result[name] = value
-
-    return result
-
-
+# -----------------------------
+# 메트릭 조회
+# -----------------------------
 def metric_name_to_field(metric_name: str) -> str:
     mapping = {
         "ProcessedPromptTokens": "prompt_tokens",
@@ -138,12 +195,12 @@ def query_metrics_for_region(
                     "resource_id": resource_id,
                     "region": region,
                     "metric_name": metric_name,
-                    "model_deployment_name": dimension_map.get("ModelDeploymentName", ""),
-                    "model_name": dimension_map.get("ModelName", ""),
-                    "model_version": dimension_map.get("ModelVersion", ""),
-                    "api_name": dimension_map.get("ApiName", ""),
-                    "usage_channel": dimension_map.get("UsageChannel", ""),
-                    "feature_name": dimension_map.get("FeatureName", ""),
+                    "model_deployment_name": normalize_dimension_value(dimension_map.get("ModelDeploymentName")),
+                    "model_name": normalize_dimension_value(dimension_map.get("ModelName")),
+                    "model_version": normalize_dimension_value(dimension_map.get("ModelVersion")),
+                    "api_name": normalize_dimension_value(dimension_map.get("ApiName")),
+                    "usage_channel": normalize_dimension_value(dimension_map.get("UsageChannel")),
+                    "feature_name": normalize_dimension_value(dimension_map.get("FeatureName")),
                     "total": total_value,
                     "raw_dimensions": dimension_map,
                 })
@@ -161,9 +218,6 @@ def normalize_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             row["model_deployment_name"],
             row["model_name"],
             row["model_version"],
-            row["api_name"],
-            row["usage_channel"],
-            row["feature_name"],
         )
 
         if key not in grouped:
@@ -173,9 +227,6 @@ def normalize_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "model_deployment_name": row["model_deployment_name"],
                 "model_name": row["model_name"],
                 "model_version": row["model_version"],
-                "api_name": row["api_name"],
-                "usage_channel": row["usage_channel"],
-                "feature_name": row["feature_name"],
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "total_tokens": 0,
@@ -195,37 +246,6 @@ def sum_items(items: list[dict[str, Any]]) -> dict[str, float]:
         "completion_tokens": sum(x.get("completion_tokens", 0) for x in items),
         "total_tokens": sum(x.get("total_tokens", 0) for x in items),
     }
-
-
-def calculate_change(current_value: float | None, previous_value: float | None) -> dict[str, float | None]:
-    if current_value is None or previous_value is None:
-        return {
-            "difference": None,
-            "rate_percent": None
-        }
-
-    diff = current_value - previous_value
-    rate = None
-    if previous_value != 0:
-        rate = (diff / previous_value) * 100
-
-    return {
-        "difference": diff,
-        "rate_percent": rate
-    }
-
-
-def get_kst_day_range_to_utc(days_ago: int) -> tuple[datetime, datetime, str]:
-    now_kst = datetime.now(KST)
-    target_date_kst = (now_kst - timedelta(days=days_ago)).date()
-
-    start_kst = datetime.combine(target_date_kst, datetime.min.time(), tzinfo=KST)
-    end_kst = start_kst + timedelta(days=1)
-
-    start_utc = start_kst.astimezone(timezone.utc)
-    end_utc = end_kst.astimezone(timezone.utc)
-
-    return start_utc, end_utc, str(target_date_kst)
 
 
 def fetch_day_metrics(
@@ -262,6 +282,9 @@ def fetch_day_metrics(
     }
 
 
+# -----------------------------
+# 비용 조회
+# -----------------------------
 def fetch_day_costs(
     credential: DefaultAzureCredential,
     subscription_id: str,
@@ -383,6 +406,81 @@ def fetch_day_costs(
     )
 
 
+# -----------------------------
+# 모델별 비교
+# -----------------------------
+def build_model_key(item: dict[str, Any]) -> tuple:
+    return (
+        item.get("resource_id", "unknown"),
+        item.get("region", "unknown"),
+        item.get("model_name", "unknown"),
+        item.get("model_version", "unknown"),
+        item.get("model_deployment_name", "unknown"),
+    )
+
+
+def build_model_breakdown(
+    previous_items: list[dict[str, Any]],
+    current_items: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    previous_map = {build_model_key(item): item for item in previous_items}
+    current_map = {build_model_key(item): item for item in current_items}
+
+    all_keys = set(previous_map.keys()) | set(current_map.keys())
+    result = []
+
+    for key in all_keys:
+        prev = previous_map.get(key, {})
+        curr = current_map.get(key, {})
+
+        previous_day = {
+            "prompt_tokens": prev.get("prompt_tokens", 0),
+            "completion_tokens": prev.get("completion_tokens", 0),
+            "total_tokens": prev.get("total_tokens", 0),
+        }
+        current_day = {
+            "prompt_tokens": curr.get("prompt_tokens", 0),
+            "completion_tokens": curr.get("completion_tokens", 0),
+            "total_tokens": curr.get("total_tokens", 0),
+        }
+
+        result.append({
+            "resource_id": key[0],
+            "region": key[1],
+            "model_name": key[2],
+            "model_version": key[3],
+            "model_deployment_name": key[4],
+            "previous_day": previous_day,
+            "current_day": current_day,
+            "change": {
+                "prompt_tokens": calculate_change(
+                    current_day["prompt_tokens"], previous_day["prompt_tokens"]
+                ),
+                "completion_tokens": calculate_change(
+                    current_day["completion_tokens"], previous_day["completion_tokens"]
+                ),
+                "total_tokens": calculate_change(
+                    current_day["total_tokens"], previous_day["total_tokens"]
+                ),
+            }
+        })
+
+    result.sort(
+        key=lambda x: (
+            -(x["current_day"]["total_tokens"] or 0),
+            x["model_name"],
+            x["model_version"],
+            x["model_deployment_name"],
+            x["region"],
+        )
+    )
+
+    return result
+
+
+# -----------------------------
+# 데이터 통합
+# -----------------------------
 def build_daily_compare_data() -> dict[str, Any]:
     resources = load_resources()
     credential = DefaultAzureCredential()
@@ -392,6 +490,11 @@ def build_daily_compare_data() -> dict[str, Any]:
 
     d5_metrics = fetch_day_metrics(credential, resources, days_ago=5)
     d4_metrics = fetch_day_metrics(credential, resources, days_ago=4)
+
+    model_breakdown = build_model_breakdown(
+        d5_metrics["items"],
+        d4_metrics["items"]
+    )
 
     cost_error = None
 
@@ -459,11 +562,15 @@ def build_daily_compare_data() -> dict[str, Any]:
             "summary_change": {
                 "tokens": token_change,
                 "cost": cost_change
-            }
+            },
+            "model_breakdown": model_breakdown
         }
     }
 
 
+# -----------------------------
+# LLM 리포트
+# -----------------------------
 def generate_report_text(compare_data: dict[str, Any]) -> str:
     endpoint = get_env("AZURE_OPENAI_ENDPOINT")
     deployment_name = get_env("AZURE_OPENAI_DEPLOYMENT_NAME")
@@ -480,6 +587,29 @@ def generate_report_text(compare_data: dict[str, Any]) -> str:
         azure_ad_token_provider=token_provider
     )
 
+    model_breakdown = compare_data["comparison"].get("model_breakdown", [])
+    top_models = model_breakdown[:3]
+
+    lightweight_data = {
+        "timezone": compare_data["timezone"],
+        "resource_count": compare_data["resource_count"],
+        "cost_error": compare_data.get("cost_error"),
+        "previous_day": {
+            "date_kst": compare_data["comparison"]["previous_day"]["date_kst"],
+            "summary": compare_data["comparison"]["previous_day"]["metrics"]["summary"],
+            "cost_total": compare_data["comparison"]["previous_day"]["costs"]["total_cost"],
+            "cost_available": compare_data["comparison"]["previous_day"]["costs"].get("cost_data_available", True),
+        },
+        "current_day": {
+            "date_kst": compare_data["comparison"]["current_day"]["date_kst"],
+            "summary": compare_data["comparison"]["current_day"]["metrics"]["summary"],
+            "cost_total": compare_data["comparison"]["current_day"]["costs"]["total_cost"],
+            "cost_available": compare_data["comparison"]["current_day"]["costs"].get("cost_data_available", True),
+        },
+        "summary_change": compare_data["comparison"]["summary_change"],
+        "top_models": top_models
+    }
+
     system_prompt = """
 너는 Azure OpenAI 비용 분석 리포트를 작성하는 FinOps 분석가다.
 사용자가 제공한 JSON 데이터를 바탕으로 짧고 명확한 한국어 일일 리포트를 작성한다.
@@ -487,11 +617,11 @@ def generate_report_text(compare_data: dict[str, Any]) -> str:
 규칙:
 1. 과장하지 말고 데이터에 근거해서만 작성한다.
 2. 값이 0이거나 변화가 없으면 '변동이 없습니다'처럼 담백하게 쓴다.
-3. 5문장 이내로 작성한다.
+3. 6문장 이내로 작성한다.
 4. 날짜는 KST 기준이라고 자연스럽게 반영한다.
 5. 금액 단위는 원으로 표기하되, 값이 없으면 비용 데이터 조회에 실패했다고 쓴다.
 6. 토큰은 input/output/total 순서로 언급하면 좋다.
-7. 모델명이 비어 있으면 모델명 언급 없이 전체 사용량 기준으로 쓴다.
+7. 모델별 정보가 있으면 변화가 큰 상위 모델 1~3개를 자연스럽게 언급한다.
 8. cost_data_available가 false이거나 cost_error가 있으면, 비용 데이터는 일시적으로 조회되지 않았다고 안내하고 토큰 사용량 중심으로 리포트를 작성한다.
 """
 
@@ -499,7 +629,7 @@ def generate_report_text(compare_data: dict[str, Any]) -> str:
 다음 JSON 데이터를 기반으로 Azure OpenAI 일일 리포트를 한국어로 작성해줘.
 
 데이터:
-{json.dumps(compare_data, ensure_ascii=False, indent=2)}
+{json.dumps(lightweight_data, ensure_ascii=False, indent=2)}
 """
 
     response = client.chat.completions.create(
@@ -509,18 +639,65 @@ def generate_report_text(compare_data: dict[str, Any]) -> str:
             {"role": "user", "content": user_prompt}
         ],
         temperature=0.2,
-        max_tokens=400
+        max_tokens=500
     )
 
     return response.choices[0].message.content.strip()
 
 
-def format_number(value: float | int | None) -> str:
-    if value is None:
-        return "-"
-    if isinstance(value, float):
-        return f"{value:,.2f}"
-    return f"{value:,}"
+# -----------------------------
+# HTML 메일
+# -----------------------------
+def build_model_breakdown_html(compare_data: dict[str, Any]) -> str:
+    model_breakdown = compare_data["comparison"].get("model_breakdown", [])
+    if not model_breakdown:
+        return """
+        <h3>모델별 토큰 비교</h3>
+        <p>모델별 토큰 데이터가 없습니다.</p>
+        """
+
+    prev_day = compare_data["comparison"]["previous_day"]["date_kst"]
+    curr_day = compare_data["comparison"]["current_day"]["date_kst"]
+
+    rows_html = ""
+    for item in model_breakdown:
+        rows_html += f"""
+        <tr>
+          <td>{item["model_name"]}</td>
+          <td>{item["model_version"]}</td>
+          <td>{item["model_deployment_name"]}</td>
+          <td>{item["region"]}</td>
+          <td>{format_number(item["previous_day"]["prompt_tokens"])}</td>
+          <td>{format_number(item["current_day"]["prompt_tokens"])}</td>
+          <td>{format_number(item["previous_day"]["completion_tokens"])}</td>
+          <td>{format_number(item["current_day"]["completion_tokens"])}</td>
+          <td>{format_number(item["previous_day"]["total_tokens"])}</td>
+          <td>{format_number(item["current_day"]["total_tokens"])}</td>
+          <td>{format_number(item["change"]["total_tokens"]["difference"])}</td>
+          <td>{format_number(item["change"]["total_tokens"]["rate_percent"])}%</td>
+        </tr>
+        """
+
+    return f"""
+    <h3>모델별 토큰 비교</h3>
+    <table border="1" cellpadding="6" cellspacing="0" style="border-collapse: collapse; font-size: 12px;">
+      <tr>
+        <th>Model</th>
+        <th>Version</th>
+        <th>Deployment</th>
+        <th>Region</th>
+        <th>{prev_day} Input</th>
+        <th>{curr_day} Input</th>
+        <th>{prev_day} Output</th>
+        <th>{curr_day} Output</th>
+        <th>{prev_day} Total</th>
+        <th>{curr_day} Total</th>
+        <th>Total 증감</th>
+        <th>Total 증감률</th>
+      </tr>
+      {rows_html}
+    </table>
+    """
 
 
 def build_email_html(report_text: str, compare_data: dict[str, Any]) -> str:
@@ -557,6 +734,8 @@ def build_email_html(report_text: str, compare_data: dict[str, Any]) -> str:
         </table>
         """
 
+    model_breakdown_section = build_model_breakdown_html(compare_data)
+
     html = f"""
     <html>
       <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #222;">
@@ -566,7 +745,7 @@ def build_email_html(report_text: str, compare_data: dict[str, Any]) -> str:
         <h3>요약</h3>
         <p>{report_text}</p>
 
-        <h3>토큰 요약</h3>
+        <h3>전체 토큰 요약</h3>
         <table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse;">
           <tr>
             <th>항목</th>
@@ -598,6 +777,8 @@ def build_email_html(report_text: str, compare_data: dict[str, Any]) -> str:
           </tr>
         </table>
 
+        {model_breakdown_section}
+
         {cost_section}
 
         <p style="margin-top: 24px; color: #666; font-size: 12px;">
@@ -609,6 +790,9 @@ def build_email_html(report_text: str, compare_data: dict[str, Any]) -> str:
     return html
 
 
+# -----------------------------
+# 메일 발송
+# -----------------------------
 def send_email(subject: str, html_body: str) -> dict[str, Any]:
     smtp_host = get_env("SMTP_HOST")
     smtp_port = int(get_env("SMTP_PORT"))
@@ -644,6 +828,9 @@ def send_email(subject: str, html_body: str) -> dict[str, Any]:
     }
 
 
+# -----------------------------
+# 실행
+# -----------------------------
 def execute_daily_report_send() -> dict[str, Any]:
     compare_data = build_daily_compare_data()
     report_text = generate_report_text(compare_data)
@@ -662,6 +849,9 @@ def execute_daily_report_send() -> dict[str, Any]:
     }
 
 
+# -----------------------------
+# 테스트/운영용 함수
+# -----------------------------
 @app.route(route="daily_compare", methods=["GET"])
 def daily_compare(req: func.HttpRequest) -> func.HttpResponse:
     try:
@@ -681,10 +871,12 @@ def daily_report_preview(req: func.HttpRequest) -> func.HttpResponse:
     try:
         compare_data = build_daily_compare_data()
         report_text = generate_report_text(compare_data)
+        html_body = build_email_html(report_text, compare_data)
 
         result = {
             "report_text": report_text,
-            "source_data": compare_data
+            "source_data": compare_data,
+            "html_preview": html_body
         }
 
         return func.HttpResponse(
