@@ -102,8 +102,7 @@ def load_resources() -> list[dict[str, str]]:
 
 
 # -----------------------------
-# Metrics REST API 기반 조회
-# 이번 버전은 filter 제거한 디버깅용 버전
+# 메트릭 조회
 # -----------------------------
 def get_azure_management_token(credential: DefaultAzureCredential) -> str:
     return credential.get_token("https://management.azure.com/.default").token
@@ -127,28 +126,42 @@ def query_metric_split_by_deployment(
     end_time_utc: datetime,
 ) -> list[dict[str, Any]]:
     """
-    Azure Monitor Metrics REST API 조회
-    현재는 원인 파악을 위해 filter를 제거한 상태
+    1차: ModelDeploymentName 기준 split 시도
+    2차: 실패하면 aggregate 조회 fallback
     """
     token = get_azure_management_token(credential)
-
     url = f"https://management.azure.com{resource_id}/providers/microsoft.insights/metrics"
 
-    params = {
-        "api-version": "2018-01-01",
-        "metricnames": metric_name,
-        "timespan": f"{start_time_utc.isoformat()}/{end_time_utc.isoformat()}",
-        "interval": "P1D",
-        "aggregation": "Total",
-        # "filter": "ModelDeploymentName eq '*'",  # 디버깅을 위해 잠시 제거
-    }
+    def call_metrics_api(filter_expr: str | None = None) -> requests.Response:
+        params = {
+            "api-version": "2018-01-01",
+            "metricnames": metric_name,
+            "timespan": f"{start_time_utc.isoformat()}/{end_time_utc.isoformat()}",
+            "interval": "P1D",
+            "aggregation": "Total",
+        }
+        if filter_expr:
+            params["$filter"] = filter_expr
 
-    response = requests.get(
-        url,
-        headers={"Authorization": f"Bearer {token}"},
-        params=params,
-        timeout=60,
-    )
+        return requests.get(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            params=params,
+            timeout=60,
+        )
+
+    # 1차 split 시도
+    response = call_metrics_api("ModelDeploymentName eq '*'")
+
+    # 실패 시 fallback
+    if response.status_code != 200:
+        logging.warning(
+            "Metrics split query failed. fallback to aggregate. metric=%s status=%s body=%s",
+            metric_name,
+            response.status_code,
+            response.text,
+        )
+        response = call_metrics_api()
 
     if response.status_code != 200:
         raise RuntimeError(f"Metrics API 호출 실패: {response.status_code} / {response.text}")
@@ -159,6 +172,7 @@ def query_metric_split_by_deployment(
 
     for metric in values:
         metric_name_value = (((metric.get("name") or {}).get("value")) or metric_name)
+
         for ts in metric.get("timeseries", []) or []:
             metadata = extract_metadata_values(ts)
 
@@ -296,7 +310,7 @@ def fetch_day_metrics(
             credential=credential,
             resource=resource,
             start_time_utc=start_utc,
-            end_time_utc=end_time_utc,
+            end_time_utc=end_utc,
         )
         all_rows.extend(rows)
 
@@ -306,7 +320,7 @@ def fetch_day_metrics(
     return {
         "target_date_kst": target_date_kst,
         "start_time_utc": start_utc.isoformat(),
-        "end_time_utc": end_time_utc.isoformat(),
+        "end_time_utc": end_utc.isoformat(),
         "items": normalized,
         "summary": summary,
     }
