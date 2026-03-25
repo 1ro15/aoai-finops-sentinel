@@ -70,6 +70,10 @@ def get_kst_day_range_to_utc(days_ago: int) -> tuple[datetime, datetime, str]:
     return start_utc, end_utc, str(target_date_kst)
 
 
+def to_utc_z(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 # -----------------------------
 # 리소스 설정
 # -----------------------------
@@ -136,7 +140,7 @@ def query_metric_split_by_deployment(
         params = {
             "api-version": "2018-01-01",
             "metricnames": metric_name,
-            "timespan": f"{start_time_utc.isoformat()}/{end_time_utc.isoformat()}",
+            "timespan": f"{to_utc_z(start_time_utc)}/{to_utc_z(end_time_utc)}",
             "interval": "P1D",
             "aggregation": "Total",
         }
@@ -972,3 +976,4 @@ def daily_report_timer(mytimer: func.TimerRequest) -> None:
     except Exception:
         logging.exception("daily_report_timer failed")
         raise
+    
