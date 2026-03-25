@@ -28,11 +28,11 @@ def get_env(name: str) -> str:
     return value
 
 
-def format_number(value: float | int | None) -> str:
+def format_number(value: float | int | None, digits: int = 0) -> str:
     if value is None:
         return "-"
     if isinstance(value, float):
-        return f"{value:,.2f}"
+        return f"{value:,.{digits}f}"
     return f"{value:,}"
 
 
@@ -271,7 +271,6 @@ def normalize_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             row["region"],
             row["model_deployment_name"],
             row["model_name"],
-            row["model_version"],
         )
 
         if key not in grouped:
@@ -280,7 +279,6 @@ def normalize_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "region": row["region"],
                 "model_deployment_name": row["model_deployment_name"],
                 "model_name": row["model_name"],
-                "model_version": row["model_version"],
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "total_tokens": 0,
@@ -464,7 +462,6 @@ def build_model_key(item: dict[str, Any]) -> tuple:
         item.get("resource_id", "unknown"),
         item.get("region", "unknown"),
         item.get("model_name", "unknown"),
-        item.get("model_version", "-"),
         item.get("model_deployment_name", "unknown"),
     )
 
@@ -498,8 +495,7 @@ def build_model_breakdown(
             "resource_id": key[0],
             "region": key[1],
             "model_name": key[2],
-            "model_version": key[3],
-            "model_deployment_name": key[4],
+            "model_deployment_name": key[3],
             "previous_day": previous_day,
             "current_day": current_day,
             "change": {
@@ -519,7 +515,6 @@ def build_model_breakdown(
         key=lambda x: (
             -(x["current_day"]["total_tokens"] or 0),
             x["model_name"],
-            x["model_version"],
             x["model_deployment_name"],
             x["region"],
         )
@@ -702,7 +697,7 @@ def build_model_breakdown_html(compare_data: dict[str, Any]) -> str:
     model_breakdown = compare_data["comparison"].get("model_breakdown", [])
     if not model_breakdown:
         return """
-        <h3>모델별 토큰 비교</h3>
+        <h3 style="margin:24px 0 8px;">모델별 토큰 비교</h3>
         <p>모델별 토큰 데이터가 없습니다.</p>
         """
 
@@ -714,36 +709,32 @@ def build_model_breakdown_html(compare_data: dict[str, Any]) -> str:
         rows_html += f"""
         <tr>
           <td>{item["model_name"]}</td>
-          <td>{item["model_version"]}</td>
           <td>{item["model_deployment_name"]}</td>
-          <td>{item["region"]}</td>
-          <td>{format_number(item["previous_day"]["prompt_tokens"])}</td>
-          <td>{format_number(item["current_day"]["prompt_tokens"])}</td>
-          <td>{format_number(item["previous_day"]["completion_tokens"])}</td>
-          <td>{format_number(item["current_day"]["completion_tokens"])}</td>
-          <td>{format_number(item["previous_day"]["total_tokens"])}</td>
-          <td>{format_number(item["current_day"]["total_tokens"])}</td>
-          <td>{format_number(item["change"]["total_tokens"]["difference"])}</td>
-          <td>{format_number(item["change"]["total_tokens"]["rate_percent"])}%</td>
+          <td style="text-align:right;">{format_number(item["previous_day"]["prompt_tokens"])}</td>
+          <td style="text-align:right;">{format_number(item["current_day"]["prompt_tokens"])}</td>
+          <td style="text-align:right;">{format_number(item["previous_day"]["completion_tokens"])}</td>
+          <td style="text-align:right;">{format_number(item["current_day"]["completion_tokens"])}</td>
+          <td style="text-align:right;">{format_number(item["previous_day"]["total_tokens"])}</td>
+          <td style="text-align:right;">{format_number(item["current_day"]["total_tokens"])}</td>
+          <td style="text-align:right;">{format_number(item["change"]["total_tokens"]["difference"])}</td>
+          <td style="text-align:right;">{format_number(item["change"]["total_tokens"]["rate_percent"], 2)}%</td>
         </tr>
         """
 
     return f"""
-    <h3>모델별 토큰 비교</h3>
-    <table border="1" cellpadding="6" cellspacing="0" style="border-collapse: collapse; font-size: 12px;">
-      <tr>
-        <th>Model</th>
-        <th>Version</th>
-        <th>Deployment</th>
-        <th>Region</th>
-        <th>{prev_day} Input</th>
-        <th>{curr_day} Input</th>
-        <th>{prev_day} Output</th>
-        <th>{curr_day} Output</th>
-        <th>{prev_day} Total</th>
-        <th>{curr_day} Total</th>
-        <th>Total 증감</th>
-        <th>Total 증감률</th>
+    <h3 style="margin:24px 0 8px;">모델별 토큰 비교</h3>
+    <table style="border-collapse:collapse; width:100%; max-width:1100px; font-size:13px;">
+      <tr style="background:#f3f4f6;">
+        <th style="border:1px solid #d1d5db; padding:8px;">모델명</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">배포명</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">{prev_day} Input</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">{curr_day} Input</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">{prev_day} Output</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">{curr_day} Output</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">{prev_day} Total</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">{curr_day} Total</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">Total 증감</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">Total 증감률</th>
       </tr>
       {rows_html}
     </table>
@@ -760,26 +751,26 @@ def build_email_html(report_text: str, compare_data: dict[str, Any]) -> str:
 
     if curr_day["costs"].get("cost_data_available") is False:
         cost_section = """
-        <h3>비용 요약</h3>
-        <p>비용 데이터는 일시적으로 조회되지 않아 이번 리포트에는 포함되지 않았습니다.</p>
+        <h3 style="margin:24px 0 8px;">비용 요약</h3>
+        <p style="margin:8px 0 0;">비용 데이터는 일시적으로 조회되지 않아 이번 리포트에는 포함되지 않았습니다.</p>
         """
     else:
         cost_section = f"""
-        <h3>비용 요약</h3>
-        <table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse;">
-          <tr>
-            <th>항목</th>
-            <th>{prev_day["date_kst"]}</th>
-            <th>{curr_day["date_kst"]}</th>
-            <th>증감</th>
-            <th>증감률</th>
+        <h3 style="margin:24px 0 8px;">비용 요약</h3>
+        <table style="border-collapse:collapse; width:100%; max-width:700px; font-size:13px;">
+          <tr style="background:#f3f4f6;">
+            <th style="border:1px solid #d1d5db; padding:8px;">항목</th>
+            <th style="border:1px solid #d1d5db; padding:8px;">{prev_day["date_kst"]}</th>
+            <th style="border:1px solid #d1d5db; padding:8px;">{curr_day["date_kst"]}</th>
+            <th style="border:1px solid #d1d5db; padding:8px;">증감</th>
+            <th style="border:1px solid #d1d5db; padding:8px;">증감률</th>
           </tr>
           <tr>
-            <td>Total Cost ({currency})</td>
-            <td>{format_number(prev_day["costs"]["total_cost"])}</td>
-            <td>{format_number(curr_day["costs"]["total_cost"])}</td>
-            <td>{format_number(cost_change["difference"])}</td>
-            <td>{format_number(cost_change["rate_percent"])}%</td>
+            <td style="border:1px solid #d1d5db; padding:8px;">Total Cost ({currency})</td>
+            <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(prev_day["costs"]["total_cost"], 4)}</td>
+            <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(curr_day["costs"]["total_cost"], 4)}</td>
+            <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(cost_change["difference"], 4)}</td>
+            <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(cost_change["rate_percent"], 2)}%</td>
           </tr>
         </table>
         """
@@ -788,52 +779,60 @@ def build_email_html(report_text: str, compare_data: dict[str, Any]) -> str:
 
     html = f"""
     <html>
-      <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #222;">
-        <h2>[AOAI FinOps Sentinel] Azure OpenAI 일일 비용 리포트</h2>
-        <p><strong>비교 기준:</strong> {prev_day["date_kst"]} → {curr_day["date_kst"]} (KST)</p>
+      <body style="font-family: Arial, 'Malgun Gothic', sans-serif; line-height:1.6; color:#222; margin:0; padding:24px; background:#ffffff;">
+        <div style="max-width:1200px; margin:0 auto;">
+          <h2 style="margin:0 0 12px;">[AOAI FinOps Sentinel] Azure OpenAI 일일 비용 리포트</h2>
 
-        <h3>요약</h3>
-        <p>{report_text}</p>
+          <p style="margin:0 0 20px;">
+            <strong>비교 기준:</strong><br>
+            {prev_day["date_kst"]} → {curr_day["date_kst"]} (KST)
+          </p>
 
-        <h3>전체 토큰 요약</h3>
-        <table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse;">
-          <tr>
-            <th>항목</th>
-            <th>{prev_day["date_kst"]}</th>
-            <th>{curr_day["date_kst"]}</th>
-            <th>증감</th>
-            <th>증감률</th>
-          </tr>
-          <tr>
-            <td>Input Tokens</td>
-            <td>{format_number(prev_day["metrics"]["summary"]["prompt_tokens"])}</td>
-            <td>{format_number(curr_day["metrics"]["summary"]["prompt_tokens"])}</td>
-            <td>{format_number(token_change["prompt_tokens"]["difference"])}</td>
-            <td>{format_number(token_change["prompt_tokens"]["rate_percent"])}%</td>
-          </tr>
-          <tr>
-            <td>Output Tokens</td>
-            <td>{format_number(prev_day["metrics"]["summary"]["completion_tokens"])}</td>
-            <td>{format_number(curr_day["metrics"]["summary"]["completion_tokens"])}</td>
-            <td>{format_number(token_change["completion_tokens"]["difference"])}</td>
-            <td>{format_number(token_change["completion_tokens"]["rate_percent"])}%</td>
-          </tr>
-          <tr>
-            <td>Total Tokens</td>
-            <td>{format_number(prev_day["metrics"]["summary"]["total_tokens"])}</td>
-            <td>{format_number(curr_day["metrics"]["summary"]["total_tokens"])}</td>
-            <td>{format_number(token_change["total_tokens"]["difference"])}</td>
-            <td>{format_number(token_change["total_tokens"]["rate_percent"])}%</td>
-          </tr>
-        </table>
+          <h3 style="margin:24px 0 8px;">요약</h3>
+          <div style="white-space:pre-line; background:#f9fafb; border:1px solid #e5e7eb; padding:14px; border-radius:8px;">
+{report_text}
+          </div>
 
-        {model_breakdown_section}
+          <h3 style="margin:24px 0 8px;">전체 토큰 요약</h3>
+          <table style="border-collapse:collapse; width:100%; max-width:700px; font-size:13px;">
+            <tr style="background:#f3f4f6;">
+              <th style="border:1px solid #d1d5db; padding:8px;">항목</th>
+              <th style="border:1px solid #d1d5db; padding:8px;">{prev_day["date_kst"]}</th>
+              <th style="border:1px solid #d1d5db; padding:8px;">{curr_day["date_kst"]}</th>
+              <th style="border:1px solid #d1d5db; padding:8px;">증감</th>
+              <th style="border:1px solid #d1d5db; padding:8px;">증감률</th>
+            </tr>
+            <tr>
+              <td style="border:1px solid #d1d5db; padding:8px;">Input Tokens</td>
+              <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(prev_day["metrics"]["summary"]["prompt_tokens"])}</td>
+              <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(curr_day["metrics"]["summary"]["prompt_tokens"])}</td>
+              <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(token_change["prompt_tokens"]["difference"])}</td>
+              <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(token_change["prompt_tokens"]["rate_percent"], 2)}%</td>
+            </tr>
+            <tr>
+              <td style="border:1px solid #d1d5db; padding:8px;">Output Tokens</td>
+              <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(prev_day["metrics"]["summary"]["completion_tokens"])}</td>
+              <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(curr_day["metrics"]["summary"]["completion_tokens"])}</td>
+              <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(token_change["completion_tokens"]["difference"])}</td>
+              <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(token_change["completion_tokens"]["rate_percent"], 2)}%</td>
+            </tr>
+            <tr>
+              <td style="border:1px solid #d1d5db; padding:8px;">Total Tokens</td>
+              <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(prev_day["metrics"]["summary"]["total_tokens"])}</td>
+              <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(curr_day["metrics"]["summary"]["total_tokens"])}</td>
+              <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(token_change["total_tokens"]["difference"])}</td>
+              <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(token_change["total_tokens"]["rate_percent"], 2)}%</td>
+            </tr>
+          </table>
 
-        {cost_section}
+          {model_breakdown_section}
 
-        <p style="margin-top: 24px; color: #666; font-size: 12px;">
-          This report was generated by AOAI FinOps Sentinel.
-        </p>
+          {cost_section}
+
+          <p style="margin-top:28px; color:#666; font-size:12px;">
+            This report was generated by AOAI FinOps Sentinel.
+          </p>
+        </div>
       </body>
     </html>
     """
@@ -978,4 +977,3 @@ def daily_report_timer(mytimer: func.TimerRequest) -> None:
     except Exception:
         logging.exception("daily_report_timer failed")
         raise
-    
