@@ -154,10 +154,8 @@ def query_metric_split_by_deployment(
             timeout=60,
         )
 
-    # 1차 split 시도
     response = call_metrics_api("ModelDeploymentName eq '*'")
 
-    # 실패 시 fallback
     if response.status_code != 200:
         logging.warning(
             "Metrics split query failed. fallback to aggregate. metric=%s status=%s body=%s",
@@ -187,17 +185,21 @@ def query_metric_split_by_deployment(
                     total_value += point_total
 
             deployment = normalize_dimension_value(
-                metadata.get("ModelDeploymentName"),
+                metadata.get("ModelDeploymentName")
+                or metadata.get("modeldeploymentname"),
                 fallback="unknown"
             )
 
             model_name = normalize_dimension_value(
-                metadata.get("ModelName"),
+                metadata.get("ModelName")
+                or metadata.get("modelname")
+                or deployment,
                 fallback=deployment
             )
 
             model_version = normalize_dimension_value(
-                metadata.get("ModelVersion"),
+                metadata.get("ModelVersion")
+                or metadata.get("modelversion"),
                 fallback="-"
             )
 
