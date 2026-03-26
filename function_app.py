@@ -21,9 +21,9 @@ KST = timezone(timedelta(hours=9))
 # -----------------------------
 # 공통 유틸
 # -----------------------------
-def get_env(name: str) -> str:
+def get_env(name: str, required: bool = True) -> str | None:
     value = os.getenv(name)
-    if not value:
+    if required and not value:
         raise ValueError(f"환경 변수 누락: {name}")
     return value
 
@@ -125,6 +125,43 @@ def find_column_index(columns: list[dict[str, Any]], *candidates: str) -> int | 
 
 
 # -----------------------------
+# 모델명 매핑
+# -----------------------------
+def load_deployment_model_map() -> dict[str, str]:
+    raw = get_env("AOAI_DEPLOYMENT_MODEL_MAP", required=False)
+    if not raw:
+        return {}
+
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        raise ValueError(f"AOAI_DEPLOYMENT_MODEL_MAP JSON 파싱 실패: {e}")
+
+    if not isinstance(data, dict):
+        raise ValueError("AOAI_DEPLOYMENT_MODEL_MAP는 JSON 객체여야 합니다.")
+
+    result: dict[str, str] = {}
+    for k, v in data.items():
+        deployment = str(k).strip()
+        model_name = str(v).strip()
+        if deployment:
+            result[deployment] = model_name
+    return result
+
+
+def resolve_model_name(raw_model_name: str | None, deployment_name: str, deployment_model_map: dict[str, str]) -> str:
+    normalized_raw = normalize_dimension_value(raw_model_name, fallback="")
+    if normalized_raw:
+        return normalized_raw
+
+    mapped = deployment_model_map.get(deployment_name)
+    if mapped:
+        return mapped
+
+    return deployment_name
+
+
+# -----------------------------
 # 리소스 설정
 # -----------------------------
 def load_resources() -> list[dict[str, str]]:
@@ -178,6 +215,7 @@ def query_metric_split_by_deployment(
     metric_name: str,
     start_time_utc: datetime,
     end_time_utc: datetime,
+    deployment_model_map: dict[str, str],
 ) -> list[dict[str, Any]]:
     token = get_azure_management_token(credential)
     url = f"https://management.azure.com{resource_id}/providers/microsoft.insights/metrics"
@@ -236,12 +274,12 @@ def query_metric_split_by_deployment(
                 fallback="unknown"
             )
 
-            model_name = normalize_dimension_value(
+            raw_model_name = (
                 metadata.get("ModelName")
                 or metadata.get("modelname")
-                or deployment,
-                fallback=deployment
             )
+
+            model_name = resolve_model_name(raw_model_name, deployment, deployment_model_map)
 
             rows.append({
                 "metric_name": metric_name_value,
@@ -259,6 +297,7 @@ def query_all_metrics_for_resource(
     resource: dict[str, str],
     start_time_utc: datetime,
     end_time_utc: datetime,
+    deployment_model_map: dict[str, str],
 ) -> list[dict[str, Any]]:
     metric_names = [
         "ProcessedPromptTokens",
@@ -275,6 +314,7 @@ def query_all_metrics_for_resource(
             metric_name=metric_name,
             start_time_utc=start_time_utc,
             end_time_utc=end_time_utc,
+            deployment_model_map=deployment_model_map,
         )
 
         for row in metric_rows:
@@ -342,6 +382,7 @@ def fetch_day_metrics(
     credential: DefaultAzureCredential,
     resources: list[dict[str, str]],
     days_ago: int,
+    deployment_model_map: dict[str, str],
 ) -> dict[str, Any]:
     start_utc, end_utc, target_date_kst = get_kst_day_range_to_utc(days_ago)
 
@@ -353,6 +394,7 @@ def fetch_day_metrics(
             resource=resource,
             start_time_utc=start_utc,
             end_time_utc=end_utc,
+            deployment_model_map=deployment_model_map,
         )
         all_rows.extend(rows)
 
@@ -645,10 +687,10 @@ def build_model_breakdown(
 
     result.sort(
         key=lambda x: (
+            x["region"],
             -(x["current_day"]["total_tokens"] or 0),
             x["model_name"],
             x["model_deployment_name"],
-            x["region"],
         )
     )
 
@@ -660,13 +702,24 @@ def build_model_breakdown(
 # -----------------------------
 def build_daily_compare_data() -> dict[str, Any]:
     resources = load_resources()
+    deployment_model_map = load_deployment_model_map()
     credential = DefaultAzureCredential()
     subscription_id = get_env("SUBSCRIPTION_ID")
 
     resource_ids = [x["resource_id"] for x in resources]
 
-    d5_metrics = fetch_day_metrics(credential, resources, days_ago=5)
-    d4_metrics = fetch_day_metrics(credential, resources, days_ago=4)
+    d5_metrics = fetch_day_metrics(
+        credential=credential,
+        resources=resources,
+        days_ago=5,
+        deployment_model_map=deployment_model_map,
+    )
+    d4_metrics = fetch_day_metrics(
+        credential=credential,
+        resources=resources,
+        days_ago=4,
+        deployment_model_map=deployment_model_map,
+    )
 
     model_breakdown = build_model_breakdown(
         d5_metrics["items"],
@@ -858,6 +911,7 @@ def build_model_breakdown_html(compare_data: dict[str, Any]) -> str:
     for item in model_breakdown:
         rows_html += f"""
         <tr>
+          <td style="border:1px solid #d1d5db; padding:8px;">{item["region"]}</td>
           <td style="border:1px solid #d1d5db; padding:8px;">{item["model_name"]}</td>
           <td style="border:1px solid #d1d5db; padding:8px;">{item["model_deployment_name"]}</td>
           <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["previous_day"]["prompt_tokens"])}</td>
@@ -873,8 +927,9 @@ def build_model_breakdown_html(compare_data: dict[str, Any]) -> str:
 
     return f"""
     <h3 style="margin:24px 0 8px;">모델별 토큰 비교</h3>
-    <table style="border-collapse:collapse; width:100%; max-width:1100px; font-size:13px;">
+    <table style="border-collapse:collapse; width:100%; max-width:1200px; font-size:13px;">
       <tr style="background:#f3f4f6;">
+        <th style="border:1px solid #d1d5db; padding:8px;">리전</th>
         <th style="border:1px solid #d1d5db; padding:8px;">모델명</th>
         <th style="border:1px solid #d1d5db; padding:8px;">배포명</th>
         <th style="border:1px solid #d1d5db; padding:8px;">{prev_day} Input</th>
@@ -930,7 +985,7 @@ def build_email_html(report_text: str, compare_data: dict[str, Any]) -> str:
     html = f"""
     <html>
       <body style="font-family: Arial, 'Malgun Gothic', sans-serif; line-height:1.6; color:#222; margin:0; padding:24px; background:#ffffff;">
-        <div style="max-width:1200px; margin:0 auto;">
+        <div style="max-width:1280px; margin:0 auto;">
           <h2 style="margin:0 0 12px;">[AOAI FinOps Sentinel] Azure OpenAI 일일 비용 리포트</h2>
 
           <p style="margin:0 0 20px;">
