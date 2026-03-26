@@ -195,6 +195,7 @@ def load_resources() -> list[dict[str, str]]:
 # -----------------------------
 # 메트릭 조회
 # -----------------------------
+
 def get_azure_management_token(credential: DefaultAzureCredential) -> str:
     return credential.get_token("https://management.azure.com/.default").token
 
@@ -209,45 +210,71 @@ def extract_metadata_values(ts: dict[str, Any]) -> dict[str, str]:
     return result
 
 
-def query_metric_split_by_deployment(
+def get_dimension_value(metadata: dict[str, str], *candidates: str, fallback: str | None = None) -> str | None:
+    lowered = {str(k).strip().lower(): str(v).strip() for k, v in metadata.items()}
+    for candidate in candidates:
+        value = lowered.get(candidate.strip().lower())
+        if value:
+            return value
+
+    if fallback is None:
+        return None
+    return normalize_dimension_value(fallback, fallback=fallback)
+
+
+def sum_timeseries_total(ts: dict[str, Any]) -> float:
+    total_value = 0.0
+    for point in ts.get("data", []) or []:
+        point_total = point.get("total")
+        if point_total is not None:
+            total_value += float(point_total)
+    return total_value
+
+
+def query_metric_by_dimension(
     credential: DefaultAzureCredential,
     resource_id: str,
     metric_name: str,
     start_time_utc: datetime,
     end_time_utc: datetime,
-    deployment_model_map: dict[str, str],
+    dimension_name: str | None = None,
 ) -> list[dict[str, Any]]:
     token = get_azure_management_token(credential)
     url = f"https://management.azure.com{resource_id}/providers/microsoft.insights/metrics"
 
-    def call_metrics_api(filter_expr: str | None = None) -> requests.Response:
-        params = {
-            "api-version": "2018-01-01",
-            "metricnames": metric_name,
-            "timespan": f"{to_utc_z(start_time_utc)}/{to_utc_z(end_time_utc)}",
-            "interval": "P1D",
-            "aggregation": "Total",
-        }
-        if filter_expr:
-            params["$filter"] = filter_expr
+    params = {
+        "api-version": "2018-01-01",
+        "metricnames": metric_name,
+        "timespan": f"{to_utc_z(start_time_utc)}/{to_utc_z(end_time_utc)}",
+        "interval": "P1D",
+        "aggregation": "Total",
+    }
+    if dimension_name:
+        params["$filter"] = f"{dimension_name} eq '*'"
 
-        return requests.get(
-            url,
-            headers={"Authorization": f"Bearer {token}"},
-            params=params,
-            timeout=60,
-        )
+    response = requests.get(
+        url,
+        headers={"Authorization": f"Bearer {token}"},
+        params=params,
+        timeout=60,
+    )
 
-    response = call_metrics_api("ModelDeploymentName eq '*'")
-
-    if response.status_code != 200:
+    if response.status_code != 200 and dimension_name:
         logging.warning(
-            "Metrics split query failed. fallback to aggregate. metric=%s status=%s body=%s",
+            "Metrics split query failed. fallback to aggregate. metric=%s dimension=%s status=%s body=%s",
             metric_name,
+            dimension_name,
             response.status_code,
             response.text,
         )
-        response = call_metrics_api()
+        return query_metric_by_dimension(
+            credential=credential,
+            resource_id=resource_id,
+            metric_name=metric_name,
+            start_time_utc=start_time_utc,
+            end_time_utc=end_time_utc,
+            dimension_name=None,
+        )
 
     if response.status_code != 200:
         raise RuntimeError(f"Metrics API 호출 실패: {response.status_code} / {response.text}")
@@ -262,34 +289,151 @@ def query_metric_split_by_deployment(
         for ts in metric.get("timeseries", []) or []:
             metadata = extract_metadata_values(ts)
 
-            total_value = 0
-            for point in ts.get("data", []) or []:
-                point_total = point.get("total")
-                if point_total is not None:
-                    total_value += point_total
-
-            deployment = normalize_dimension_value(
-                metadata.get("ModelDeploymentName")
-                or metadata.get("modeldeploymentname"),
-                fallback="unknown"
-            )
-
-            raw_model_name = (
-                metadata.get("ModelName")
-                or metadata.get("modelname")
-            )
-
-            model_name = resolve_model_name(raw_model_name, deployment, deployment_model_map)
-
             rows.append({
                 "metric_name": metric_name_value,
-                "model_deployment_name": deployment,
-                "model_name": model_name,
+                "dimension_name": dimension_name or "aggregate",
+                "model_deployment_name": normalize_dimension_value(
+                    get_dimension_value(metadata, "ModelDeploymentName", fallback="unknown"),
+                    fallback="unknown"
+                ),
+                "model_name": normalize_dimension_value(
+                    get_dimension_value(metadata, "ModelName", fallback="unknown"),
+                    fallback="unknown"
+                ),
                 "raw_dimensions": metadata,
-                "total": total_value,
+                "total": sum_timeseries_total(ts),
             })
 
     return rows
+
+
+def merge_dimension_rows(
+    deployment_rows: list[dict[str, Any]],
+    model_rows: list[dict[str, Any]],
+    deployment_model_map: dict[str, str],
+) -> list[dict[str, Any]]:
+    matched_model_indexes: set[int] = set()
+
+    model_candidates_by_total: dict[float, list[tuple[int, dict[str, Any]]]] = {}
+    for idx, model_row in enumerate(model_rows):
+        model_name = normalize_dimension_value(model_row.get("model_name"), fallback="unknown")
+        if model_name == "unknown":
+            continue
+        total = float(model_row.get("total", 0))
+        model_candidates_by_total.setdefault(total, []).append((idx, model_row))
+
+    merged_rows: list[dict[str, Any]] = []
+
+    for dep_row in deployment_rows:
+        deployment_name = normalize_dimension_value(dep_row.get("model_deployment_name"), fallback="unknown")
+        raw_model_name = normalize_dimension_value(dep_row.get("model_name"), fallback="unknown")
+        resolved_model_name = None
+        resolution_source = None
+        matched_model_row = None
+
+        if raw_model_name != "unknown":
+            resolved_model_name = raw_model_name
+            resolution_source = "deployment_dimension"
+        else:
+            same_total_candidates = [
+                (idx, candidate_row)
+                for idx, candidate_row in model_candidates_by_total.get(float(dep_row.get("total", 0)), [])
+                if idx not in matched_model_indexes
+            ]
+
+            if len(same_total_candidates) == 1:
+                matched_idx, matched_model_row = same_total_candidates[0]
+                matched_model_indexes.add(matched_idx)
+                resolved_model_name = normalize_dimension_value(
+                    matched_model_row.get("model_name"),
+                    fallback="unknown"
+                )
+                resolution_source = "model_dimension_by_total_match"
+
+        if not resolved_model_name or resolved_model_name == "unknown":
+            mapped = deployment_model_map.get(deployment_name)
+            if mapped:
+                resolved_model_name = mapped
+                resolution_source = "deployment_model_map"
+
+        if not resolved_model_name or resolved_model_name == "unknown":
+            resolved_model_name = deployment_name
+            resolution_source = "deployment_name_fallback"
+
+        merged_raw_dimensions = dict(dep_row.get("raw_dimensions") or {})
+        if matched_model_row:
+            merged_raw_dimensions["matchedModelName"] = matched_model_row.get("model_name", "unknown")
+            merged_raw_dimensions["matchedModelDimensionTotal"] = str(matched_model_row.get("total", 0))
+            for k, v in (matched_model_row.get("raw_dimensions") or {}).items():
+                if k not in merged_raw_dimensions:
+                    merged_raw_dimensions[k] = v
+
+        merged_rows.append({
+            "metric_name": dep_row["metric_name"],
+            "model_deployment_name": deployment_name,
+            "model_name": resolved_model_name,
+            "raw_dimensions": merged_raw_dimensions,
+            "total": dep_row["total"],
+            "model_resolution_source": resolution_source,
+        })
+
+    if not deployment_rows:
+        for model_row in model_rows:
+            model_name = normalize_dimension_value(model_row.get("model_name"), fallback="unknown")
+            resolved_model_name = model_name if model_name != "unknown" else "unknown"
+            merged_rows.append({
+                "metric_name": model_row["metric_name"],
+                "model_deployment_name": resolved_model_name,
+                "model_name": resolved_model_name,
+                "raw_dimensions": model_row.get("raw_dimensions", {}),
+                "total": model_row["total"],
+                "model_resolution_source": "model_dimension_only",
+            })
+
+    return merged_rows
+
+
+def query_metric_split_by_deployment(
+    credential: DefaultAzureCredential,
+    resource_id: str,
+    metric_name: str,
+    start_time_utc: datetime,
+    end_time_utc: datetime,
+    deployment_model_map: dict[str, str],
+) -> list[dict[str, Any]]:
+    deployment_rows = query_metric_by_dimension(
+        credential=credential,
+        resource_id=resource_id,
+        metric_name=metric_name,
+        start_time_utc=start_time_utc,
+        end_time_utc=end_time_utc,
+        dimension_name="ModelDeploymentName",
+    )
+    model_rows = query_metric_by_dimension(
+        credential=credential,
+        resource_id=resource_id,
+        metric_name=metric_name,
+        start_time_utc=start_time_utc,
+        end_time_utc=end_time_utc,
+        dimension_name="ModelName",
+    )
+
+    merged_rows = merge_dimension_rows(
+        deployment_rows=deployment_rows,
+        model_rows=model_rows,
+        deployment_model_map=deployment_model_map,
+    )
+
+    logging.info(
+        "Metric merge completed. metric=%s resource_id=%s deployment_rows=%s model_rows=%s merged_rows=%s",
+        metric_name,
+        resource_id,
+        len(deployment_rows),
+        len(model_rows),
+        len(merged_rows),
+    )
+
+    return merged_rows
 
 
 def query_all_metrics_for_resource(
@@ -326,6 +470,7 @@ def query_all_metrics_for_resource(
                 "model_name": row["model_name"],
                 "raw_dimensions": row["raw_dimensions"],
                 "total": row["total"],
+                "model_resolution_source": row.get("model_resolution_source", "unknown"),
             })
 
     return all_rows
@@ -361,6 +506,7 @@ def normalize_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "completion_tokens": 0,
                 "total_tokens": 0,
                 "raw_dimensions": row["raw_dimensions"],
+                "model_resolution_source": row.get("model_resolution_source", "unknown"),
             }
 
         field_name = metric_name_to_field(row["metric_name"])
