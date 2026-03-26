@@ -195,6 +195,12 @@ def load_resources() -> list[dict[str, str]]:
 # -----------------------------
 # 메트릭 조회
 # -----------------------------
+METRIC_NAMES = [
+    "ProcessedPromptTokens",
+    "GeneratedTokens",
+    "TokenTransaction",
+]
+
 
 def get_azure_management_token(credential: DefaultAzureCredential) -> str:
     return credential.get_token("https://management.azure.com/.default").token
@@ -210,25 +216,10 @@ def extract_metadata_values(ts: dict[str, Any]) -> dict[str, str]:
     return result
 
 
-def get_dimension_value(metadata: dict[str, str], *candidates: str, fallback: str | None = None) -> str | None:
-    lowered = {str(k).strip().lower(): str(v).strip() for k, v in metadata.items()}
-    for candidate in candidates:
-        value = lowered.get(candidate.strip().lower())
-        if value:
-            return value
-
-    if fallback is None:
+def make_dimension_filter(dimension_name: str | None) -> str | None:
+    if not dimension_name:
         return None
-    return normalize_dimension_value(fallback, fallback=fallback)
-
-
-def sum_timeseries_total(ts: dict[str, Any]) -> float:
-    total_value = 0.0
-    for point in ts.get("data", []) or []:
-        point_total = point.get("total")
-        if point_total is not None:
-            total_value += float(point_total)
-    return total_value
+    return f"{dimension_name} eq '*'"
 
 
 def query_metric_by_dimension(
@@ -237,10 +228,11 @@ def query_metric_by_dimension(
     metric_name: str,
     start_time_utc: datetime,
     end_time_utc: datetime,
-    dimension_name: str | None = None,
-) -> list[dict[str, Any]]:
+    dimension_name: str | None,
+) -> dict[str, Any]:
     token = get_azure_management_token(credential)
     url = f"https://management.azure.com{resource_id}/providers/microsoft.insights/metrics"
+    filter_expr = make_dimension_filter(dimension_name)
 
     params = {
         "api-version": "2018-01-01",
@@ -249,8 +241,8 @@ def query_metric_by_dimension(
         "interval": "P1D",
         "aggregation": "Total",
     }
-    if dimension_name:
-        params["$filter"] = f"{dimension_name} eq '*'"
+    if filter_expr:
+        params["$filter"] = filter_expr
 
     response = requests.get(
         url,
@@ -259,221 +251,54 @@ def query_metric_by_dimension(
         timeout=60,
     )
 
-    if response.status_code != 200 and dimension_name:
-        logging.warning(
-            "Metrics split query failed. fallback to aggregate. metric=%s dimension=%s status=%s body=%s",
-            metric_name,
-            dimension_name,
-            response.status_code,
-            response.text,
-        )
-        return query_metric_by_dimension(
-            credential=credential,
-            resource_id=resource_id,
-            metric_name=metric_name,
-            start_time_utc=start_time_utc,
-            end_time_utc=end_time_utc,
-            dimension_name=None,
-        )
-
-    if response.status_code != 200:
-        raise RuntimeError(f"Metrics API 호출 실패: {response.status_code} / {response.text}")
-
-    payload = response.json()
-    values = payload.get("value", []) or []
     rows: list[dict[str, Any]] = []
+    payload: dict[str, Any] = {}
+    timeseries_count = 0
+    metadata_key_examples: set[str] = set()
 
-    for metric in values:
-        metric_name_value = (((metric.get("name") or {}).get("value")) or metric_name)
+    if response.status_code == 200:
+        payload = response.json()
+        values = payload.get("value", []) or []
 
-        for ts in metric.get("timeseries", []) or []:
-            metadata = extract_metadata_values(ts)
+        for metric in values:
+            metric_name_value = (((metric.get("name") or {}).get("value")) or metric_name)
 
-            rows.append({
-                "metric_name": metric_name_value,
-                "dimension_name": dimension_name or "aggregate",
-                "model_deployment_name": normalize_dimension_value(
-                    get_dimension_value(metadata, "ModelDeploymentName", fallback="unknown"),
-                    fallback="unknown"
-                ),
-                "model_name": normalize_dimension_value(
-                    get_dimension_value(metadata, "ModelName", fallback="unknown"),
-                    fallback="unknown"
-                ),
-                "raw_dimensions": metadata,
-                "total": sum_timeseries_total(ts),
-            })
+            for ts in metric.get("timeseries", []) or []:
+                timeseries_count += 1
+                metadata = extract_metadata_values(ts)
+                metadata_key_examples.update(metadata.keys())
 
-    return rows
+                total_value = 0.0
+                for point in ts.get("data", []) or []:
+                    point_total = point.get("total")
+                    if point_total is not None:
+                        total_value += float(point_total)
 
+                dimension_value = None
+                if dimension_name:
+                    dimension_value = (
+                        metadata.get(dimension_name)
+                        or metadata.get(dimension_name.lower())
+                    )
 
-def merge_dimension_rows(
-    deployment_rows: list[dict[str, Any]],
-    model_rows: list[dict[str, Any]],
-    deployment_model_map: dict[str, str],
-) -> list[dict[str, Any]]:
-    matched_model_indexes: set[int] = set()
+                rows.append({
+                    "metric_name": metric_name_value,
+                    "dimension_name": dimension_name,
+                    "dimension_value": normalize_dimension_value(dimension_value),
+                    "raw_dimensions": metadata,
+                    "total": total_value,
+                })
 
-    model_candidates_by_total: dict[float, list[tuple[int, dict[str, Any]]]] = {}
-    for idx, model_row in enumerate(model_rows):
-        model_name = normalize_dimension_value(model_row.get("model_name"), fallback="unknown")
-        if model_name == "unknown":
-            continue
-        total = float(model_row.get("total", 0))
-        model_candidates_by_total.setdefault(total, []).append((idx, model_row))
-
-    merged_rows: list[dict[str, Any]] = []
-
-    for dep_row in deployment_rows:
-        deployment_name = normalize_dimension_value(dep_row.get("model_deployment_name"), fallback="unknown")
-        raw_model_name = normalize_dimension_value(dep_row.get("model_name"), fallback="unknown")
-        resolved_model_name = None
-        resolution_source = None
-        matched_model_row = None
-
-        if raw_model_name != "unknown":
-            resolved_model_name = raw_model_name
-            resolution_source = "deployment_dimension"
-        else:
-            same_total_candidates = [
-                (idx, candidate_row)
-                for idx, candidate_row in model_candidates_by_total.get(float(dep_row.get("total", 0)), [])
-                if idx not in matched_model_indexes
-            ]
-
-            if len(same_total_candidates) == 1:
-                matched_idx, matched_model_row = same_total_candidates[0]
-                matched_model_indexes.add(matched_idx)
-                resolved_model_name = normalize_dimension_value(
-                    matched_model_row.get("model_name"),
-                    fallback="unknown"
-                )
-                resolution_source = "model_dimension_by_total_match"
-
-        if not resolved_model_name or resolved_model_name == "unknown":
-            mapped = deployment_model_map.get(deployment_name)
-            if mapped:
-                resolved_model_name = mapped
-                resolution_source = "deployment_model_map"
-
-        if not resolved_model_name or resolved_model_name == "unknown":
-            resolved_model_name = deployment_name
-            resolution_source = "deployment_name_fallback"
-
-        merged_raw_dimensions = dict(dep_row.get("raw_dimensions") or {})
-        if matched_model_row:
-            merged_raw_dimensions["matchedModelName"] = matched_model_row.get("model_name", "unknown")
-            merged_raw_dimensions["matchedModelDimensionTotal"] = str(matched_model_row.get("total", 0))
-            for k, v in (matched_model_row.get("raw_dimensions") or {}).items():
-                if k not in merged_raw_dimensions:
-                    merged_raw_dimensions[k] = v
-
-        merged_rows.append({
-            "metric_name": dep_row["metric_name"],
-            "model_deployment_name": deployment_name,
-            "model_name": resolved_model_name,
-            "raw_dimensions": merged_raw_dimensions,
-            "total": dep_row["total"],
-            "model_resolution_source": resolution_source,
-        })
-
-    if not deployment_rows:
-        for model_row in model_rows:
-            model_name = normalize_dimension_value(model_row.get("model_name"), fallback="unknown")
-            resolved_model_name = model_name if model_name != "unknown" else "unknown"
-            merged_rows.append({
-                "metric_name": model_row["metric_name"],
-                "model_deployment_name": resolved_model_name,
-                "model_name": resolved_model_name,
-                "raw_dimensions": model_row.get("raw_dimensions", {}),
-                "total": model_row["total"],
-                "model_resolution_source": "model_dimension_only",
-            })
-
-    return merged_rows
-
-
-def query_metric_split_by_deployment(
-    credential: DefaultAzureCredential,
-    resource_id: str,
-    metric_name: str,
-    start_time_utc: datetime,
-    end_time_utc: datetime,
-    deployment_model_map: dict[str, str],
-) -> list[dict[str, Any]]:
-    deployment_rows = query_metric_by_dimension(
-        credential=credential,
-        resource_id=resource_id,
-        metric_name=metric_name,
-        start_time_utc=start_time_utc,
-        end_time_utc=end_time_utc,
-        dimension_name="ModelDeploymentName",
-    )
-    model_rows = query_metric_by_dimension(
-        credential=credential,
-        resource_id=resource_id,
-        metric_name=metric_name,
-        start_time_utc=start_time_utc,
-        end_time_utc=end_time_utc,
-        dimension_name="ModelName",
-    )
-
-    merged_rows = merge_dimension_rows(
-        deployment_rows=deployment_rows,
-        model_rows=model_rows,
-        deployment_model_map=deployment_model_map,
-    )
-
-    logging.info(
-        "Metric merge completed. metric=%s resource_id=%s deployment_rows=%s model_rows=%s merged_rows=%s",
-        metric_name,
-        resource_id,
-        len(deployment_rows),
-        len(model_rows),
-        len(merged_rows),
-    )
-
-    return merged_rows
-
-
-def query_all_metrics_for_resource(
-    credential: DefaultAzureCredential,
-    resource: dict[str, str],
-    start_time_utc: datetime,
-    end_time_utc: datetime,
-    deployment_model_map: dict[str, str],
-) -> list[dict[str, Any]]:
-    metric_names = [
-        "ProcessedPromptTokens",
-        "GeneratedTokens",
-        "TokenTransaction",
-    ]
-
-    all_rows: list[dict[str, Any]] = []
-
-    for metric_name in metric_names:
-        metric_rows = query_metric_split_by_deployment(
-            credential=credential,
-            resource_id=resource["resource_id"],
-            metric_name=metric_name,
-            start_time_utc=start_time_utc,
-            end_time_utc=end_time_utc,
-            deployment_model_map=deployment_model_map,
-        )
-
-        for row in metric_rows:
-            all_rows.append({
-                "resource_id": resource["resource_id"],
-                "region": resource["region"],
-                "metric_name": row["metric_name"],
-                "model_deployment_name": row["model_deployment_name"],
-                "model_name": row["model_name"],
-                "raw_dimensions": row["raw_dimensions"],
-                "total": row["total"],
-                "model_resolution_source": row.get("model_resolution_source", "unknown"),
-            })
-
-    return all_rows
+    return {
+        "metric_name": metric_name,
+        "dimension_name": dimension_name,
+        "filter_expr": filter_expr,
+        "status_code": response.status_code,
+        "rows": rows,
+        "timeseries_count": timeseries_count,
+        "metadata_key_examples": sorted(metadata_key_examples),
+        "body_preview": response.text[:2000] if response.status_code != 200 else None,
+    }
 
 
 def metric_name_to_field(metric_name: str) -> str:
@@ -485,35 +310,255 @@ def metric_name_to_field(metric_name: str) -> str:
     return mapping.get(metric_name, metric_name)
 
 
-def normalize_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    grouped: dict[tuple, dict[str, Any]] = {}
+def aggregate_rows_by_dimension(
+    rows: list[dict[str, Any]],
+    resource_id: str,
+    region: str,
+    key_field_name: str,
+) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
 
     for row in rows:
-        key = (
-            row["resource_id"],
-            row["region"],
-            row["model_deployment_name"],
-            row["model_name"],
+        key_value = row["dimension_value"]
+        item = grouped.setdefault(
+            key_value,
+            {
+                "resource_id": resource_id,
+                "region": region,
+                key_field_name: key_value,
+                "prompt_tokens": 0.0,
+                "completion_tokens": 0.0,
+                "total_tokens": 0.0,
+                "raw_dimensions_by_metric": {},
+            },
         )
-
-        if key not in grouped:
-            grouped[key] = {
-                "resource_id": row["resource_id"],
-                "region": row["region"],
-                "model_deployment_name": row["model_deployment_name"],
-                "model_name": row["model_name"],
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
-                "raw_dimensions": row["raw_dimensions"],
-                "model_resolution_source": row.get("model_resolution_source", "unknown"),
-            }
 
         field_name = metric_name_to_field(row["metric_name"])
         if field_name in ("prompt_tokens", "completion_tokens", "total_tokens"):
-            grouped[key][field_name] += row["total"]
+            item[field_name] += row["total"]
+            item["raw_dimensions_by_metric"][row["metric_name"]] = row["raw_dimensions"]
 
     return list(grouped.values())
+
+
+def signature_tuple(item: dict[str, Any]) -> tuple[float, float, float]:
+    return (
+        float(item.get("prompt_tokens", 0) or 0),
+        float(item.get("completion_tokens", 0) or 0),
+        float(item.get("total_tokens", 0) or 0),
+    )
+
+
+def is_zero_signature(sig: tuple[float, float, float]) -> bool:
+    return sig == (0.0, 0.0, 0.0)
+
+
+def build_signature_index(items: list[dict[str, Any]]) -> dict[tuple[float, float, float], list[dict[str, Any]]]:
+    index: dict[tuple[float, float, float], list[dict[str, Any]]] = {}
+    for item in items:
+        index.setdefault(signature_tuple(item), []).append(item)
+    return index
+
+
+def resolve_deployment_from_model_item(
+    model_item: dict[str, Any],
+    deployment_signature_index: dict[tuple[float, float, float], list[dict[str, Any]]],
+    deployment_model_map: dict[str, str],
+) -> tuple[str, str]:
+    raw_dimensions_by_metric = model_item.get("raw_dimensions_by_metric", {})
+    for metadata in raw_dimensions_by_metric.values():
+        deployment_name = metadata.get("ModelDeploymentName") or metadata.get("modeldeploymentname")
+        if deployment_name:
+            return normalize_dimension_value(deployment_name), "model_dimension_metadata"
+
+    sig = signature_tuple(model_item)
+    if not is_zero_signature(sig):
+        candidates = deployment_signature_index.get(sig, [])
+        if len(candidates) == 1:
+            return normalize_dimension_value(candidates[0].get("model_deployment_name")), "deployment_signature_match"
+
+    reverse_matches = [deployment for deployment, model in deployment_model_map.items() if model == model_item.get("model_name")]
+    if len(reverse_matches) == 1:
+        return normalize_dimension_value(reverse_matches[0]), "deployment_model_map_reverse_unique"
+
+    return "unknown", "deployment_unresolved"
+
+
+def resolve_model_from_deployment_item(
+    deployment_item: dict[str, Any],
+    model_signature_index: dict[tuple[float, float, float], list[dict[str, Any]]],
+    deployment_model_map: dict[str, str],
+) -> tuple[str, str]:
+    raw_dimensions_by_metric = deployment_item.get("raw_dimensions_by_metric", {})
+    for metadata in raw_dimensions_by_metric.values():
+        model_name = metadata.get("ModelName") or metadata.get("modelname")
+        if model_name:
+            return normalize_dimension_value(model_name), "deployment_dimension_metadata"
+
+    sig = signature_tuple(deployment_item)
+    if not is_zero_signature(sig):
+        candidates = model_signature_index.get(sig, [])
+        if len(candidates) == 1:
+            return normalize_dimension_value(candidates[0].get("model_name")), "model_signature_match"
+
+    mapped = deployment_model_map.get(deployment_item.get("model_deployment_name", ""))
+    if mapped:
+        return normalize_dimension_value(mapped), "deployment_model_map"
+
+    return normalize_dimension_value(deployment_item.get("model_deployment_name")), "deployment_name_fallback"
+
+
+def build_final_items_for_resource(
+    resource: dict[str, str],
+    model_rows: list[dict[str, Any]],
+    deployment_rows: list[dict[str, Any]],
+    deployment_model_map: dict[str, str],
+) -> list[dict[str, Any]]:
+    model_groups = aggregate_rows_by_dimension(
+        rows=model_rows,
+        resource_id=resource["resource_id"],
+        region=resource["region"],
+        key_field_name="model_name",
+    )
+    deployment_groups = aggregate_rows_by_dimension(
+        rows=deployment_rows,
+        resource_id=resource["resource_id"],
+        region=resource["region"],
+        key_field_name="model_deployment_name",
+    )
+
+    deployment_signature_index = build_signature_index(deployment_groups)
+    model_signature_index = build_signature_index(model_groups)
+
+    final_items: list[dict[str, Any]] = []
+
+    if model_groups:
+        for model_item in model_groups:
+            deployment_name, resolution_source = resolve_deployment_from_model_item(
+                model_item=model_item,
+                deployment_signature_index=deployment_signature_index,
+                deployment_model_map=deployment_model_map,
+            )
+
+            final_items.append({
+                "resource_id": resource["resource_id"],
+                "region": resource["region"],
+                "model_deployment_name": deployment_name,
+                "model_name": normalize_dimension_value(model_item.get("model_name")),
+                "prompt_tokens": model_item.get("prompt_tokens", 0.0),
+                "completion_tokens": model_item.get("completion_tokens", 0.0),
+                "total_tokens": model_item.get("total_tokens", 0.0),
+                "raw_dimensions": {
+                    "model_dimension": model_item.get("raw_dimensions_by_metric", {}),
+                    "deployment_dimension_match": deployment_name,
+                },
+                "model_resolution_source": resolution_source,
+            })
+
+        return final_items
+
+    for deployment_item in deployment_groups:
+        model_name, resolution_source = resolve_model_from_deployment_item(
+            deployment_item=deployment_item,
+            model_signature_index=model_signature_index,
+            deployment_model_map=deployment_model_map,
+        )
+
+        final_items.append({
+            "resource_id": resource["resource_id"],
+            "region": resource["region"],
+            "model_deployment_name": normalize_dimension_value(deployment_item.get("model_deployment_name")),
+            "model_name": model_name,
+            "prompt_tokens": deployment_item.get("prompt_tokens", 0.0),
+            "completion_tokens": deployment_item.get("completion_tokens", 0.0),
+            "total_tokens": deployment_item.get("total_tokens", 0.0),
+            "raw_dimensions": {
+                "deployment_dimension": deployment_item.get("raw_dimensions_by_metric", {}),
+            },
+            "model_resolution_source": resolution_source,
+        })
+
+    return final_items
+
+
+def query_all_metrics_for_resource(
+    credential: DefaultAzureCredential,
+    resource: dict[str, str],
+    start_time_utc: datetime,
+    end_time_utc: datetime,
+    deployment_model_map: dict[str, str],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    model_rows: list[dict[str, Any]] = []
+    deployment_rows: list[dict[str, Any]] = []
+    debug_metrics: dict[str, Any] = {}
+
+    for metric_name in METRIC_NAMES:
+        model_result = query_metric_by_dimension(
+            credential=credential,
+            resource_id=resource["resource_id"],
+            metric_name=metric_name,
+            start_time_utc=start_time_utc,
+            end_time_utc=end_time_utc,
+            dimension_name="ModelName",
+        )
+        deployment_result = query_metric_by_dimension(
+            credential=credential,
+            resource_id=resource["resource_id"],
+            metric_name=metric_name,
+            start_time_utc=start_time_utc,
+            end_time_utc=end_time_utc,
+            dimension_name="ModelDeploymentName",
+        )
+
+        model_rows.extend(model_result["rows"])
+        deployment_rows.extend(deployment_result["rows"])
+
+        debug_metrics[metric_name] = {
+            "model_dimension": {
+                "status_code": model_result["status_code"],
+                "filter_expr": model_result["filter_expr"],
+                "timeseries_count": model_result["timeseries_count"],
+                "metadata_key_examples": model_result["metadata_key_examples"],
+                "sample_rows": model_result["rows"][:5],
+                "body_preview": model_result["body_preview"],
+            },
+            "deployment_dimension": {
+                "status_code": deployment_result["status_code"],
+                "filter_expr": deployment_result["filter_expr"],
+                "timeseries_count": deployment_result["timeseries_count"],
+                "metadata_key_examples": deployment_result["metadata_key_examples"],
+                "sample_rows": deployment_result["rows"][:5],
+                "body_preview": deployment_result["body_preview"],
+            },
+        }
+
+    final_items = build_final_items_for_resource(
+        resource=resource,
+        model_rows=model_rows,
+        deployment_rows=deployment_rows,
+        deployment_model_map=deployment_model_map,
+    )
+
+    debug_info = {
+        "resource_id": resource["resource_id"],
+        "region": resource["region"],
+        "metric_queries": debug_metrics,
+        "aggregated_model_groups": aggregate_rows_by_dimension(
+            rows=model_rows,
+            resource_id=resource["resource_id"],
+            region=resource["region"],
+            key_field_name="model_name",
+        ),
+        "aggregated_deployment_groups": aggregate_rows_by_dimension(
+            rows=deployment_rows,
+            resource_id=resource["resource_id"],
+            region=resource["region"],
+            key_field_name="model_deployment_name",
+        ),
+        "final_items": final_items,
+    }
+
+    return final_items, debug_info
 
 
 def sum_items(items: list[dict[str, Any]]) -> dict[str, float]:
@@ -529,33 +574,37 @@ def fetch_day_metrics(
     resources: list[dict[str, str]],
     days_ago: int,
     deployment_model_map: dict[str, str],
+    include_debug_info: bool = False,
 ) -> dict[str, Any]:
     start_utc, end_utc, target_date_kst = get_kst_day_range_to_utc(days_ago)
 
-    all_rows: list[dict[str, Any]] = []
+    all_items: list[dict[str, Any]] = []
+    debug_resources: list[dict[str, Any]] = []
 
     for resource in resources:
-        rows = query_all_metrics_for_resource(
+        items, debug_info = query_all_metrics_for_resource(
             credential=credential,
             resource=resource,
             start_time_utc=start_utc,
             end_time_utc=end_utc,
             deployment_model_map=deployment_model_map,
         )
-        all_rows.extend(rows)
+        all_items.extend(items)
+        if include_debug_info:
+            debug_resources.append(debug_info)
 
-    normalized = normalize_rows(all_rows)
-    summary = sum_items(normalized)
-
-    return {
+    result = {
         "target_date_kst": target_date_kst,
         "start_time_utc": start_utc.isoformat(),
         "end_time_utc": end_utc.isoformat(),
-        "items": normalized,
-        "summary": summary,
+        "items": all_items,
+        "summary": sum_items(all_items),
     }
 
+    if include_debug_info:
+        result["debug_resources"] = debug_resources
 
+    return result
 # -----------------------------
 # 비용 조회
 # -----------------------------
@@ -1249,6 +1298,43 @@ def execute_daily_report_send() -> dict[str, Any]:
     }
 
 
+def parse_int_param(req: func.HttpRequest, name: str, default: int) -> int:
+    raw = req.params.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    return int(raw)
+
+
+def build_model_dimension_debug(days_ago: int = 4, resource_index: int | None = None) -> dict[str, Any]:
+    resources = load_resources()
+    if resource_index is not None:
+        if resource_index < 0 or resource_index >= len(resources):
+            raise ValueError(f"resource_index 범위 오류: 0 ~ {len(resources) - 1}")
+        resources = [resources[resource_index]]
+
+    deployment_model_map = load_deployment_model_map()
+    credential = DefaultAzureCredential()
+
+    metrics = fetch_day_metrics(
+        credential=credential,
+        resources=resources,
+        days_ago=days_ago,
+        deployment_model_map=deployment_model_map,
+        include_debug_info=True,
+    )
+
+    return {
+        "days_ago": days_ago,
+        "target_date_kst": metrics["target_date_kst"],
+        "start_time_utc": metrics["start_time_utc"],
+        "end_time_utc": metrics["end_time_utc"],
+        "resource_count": len(resources),
+        "items": metrics["items"],
+        "summary": metrics["summary"],
+        "debug_resources": metrics.get("debug_resources", []),
+    }
+
+
 # -----------------------------
 # 테스트/운영용 함수
 # -----------------------------
@@ -1303,6 +1389,27 @@ def daily_report_send(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse(str(e), status_code=500, mimetype="text/plain")
 
 
+@app.route(route="model_dimension_debug", methods=["GET"])
+def model_dimension_debug(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        days_ago = parse_int_param(req, "days_ago", 4)
+        resource_index_raw = req.params.get("resource_index")
+        resource_index = int(resource_index_raw) if resource_index_raw not in (None, "") else None
+
+        result = build_model_dimension_debug(
+            days_ago=days_ago,
+            resource_index=resource_index,
+        )
+        return func.HttpResponse(
+            json.dumps(result, ensure_ascii=False, indent=2, default=str),
+            mimetype="application/json",
+            status_code=200
+        )
+    except Exception as e:
+        logging.exception("model_dimension_debug failed")
+        return func.HttpResponse(str(e), status_code=500, mimetype="text/plain")
+
+
 @app.route(route="monthly_cost_test", methods=["GET"])
 def monthly_cost_test(req: func.HttpRequest) -> func.HttpResponse:
     try:
@@ -1352,3 +1459,4 @@ def daily_report_timer(mytimer: func.TimerRequest) -> None:
     except Exception:
         logging.exception("daily_report_timer failed")
         raise
+    
