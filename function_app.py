@@ -36,6 +36,13 @@ def format_number(value: float | int | None, digits: int = 0) -> str:
     return f"{value:,}"
 
 
+def format_cost_text(value: float | None, currency: str | None = "KRW") -> str:
+    if value is None:
+        return "-"
+    unit = currency or "KRW"
+    return f"{value:,.4f} {unit}"
+
+
 def calculate_change(current_value: float | None, previous_value: float | None) -> dict[str, float | None]:
     if current_value is None or previous_value is None:
         return {"difference": None, "rate_percent": None}
@@ -760,6 +767,12 @@ def generate_report_text(compare_data: dict[str, Any]) -> str:
     model_breakdown = compare_data["comparison"].get("model_breakdown", [])
     top_models = model_breakdown[:3]
 
+    prev_costs = compare_data["comparison"]["previous_day"]["costs"]
+    curr_costs = compare_data["comparison"]["current_day"]["costs"]
+    cost_change = compare_data["comparison"]["summary_change"]["cost"]
+
+    cost_currency = curr_costs.get("currency") or prev_costs.get("currency") or "KRW"
+
     lightweight_data = {
         "timezone": compare_data["timezone"],
         "resource_count": compare_data["resource_count"],
@@ -767,16 +780,22 @@ def generate_report_text(compare_data: dict[str, Any]) -> str:
         "previous_day": {
             "date_kst": compare_data["comparison"]["previous_day"]["date_kst"],
             "summary": compare_data["comparison"]["previous_day"]["metrics"]["summary"],
-            "cost_total": compare_data["comparison"]["previous_day"]["costs"]["total_cost"],
-            "cost_available": compare_data["comparison"]["previous_day"]["costs"].get("cost_data_available", True),
+            "cost_total_text": format_cost_text(prev_costs.get("total_cost"), cost_currency),
+            "cost_available": prev_costs.get("cost_data_available", True),
         },
         "current_day": {
             "date_kst": compare_data["comparison"]["current_day"]["date_kst"],
             "summary": compare_data["comparison"]["current_day"]["metrics"]["summary"],
-            "cost_total": compare_data["comparison"]["current_day"]["costs"]["total_cost"],
-            "cost_available": compare_data["comparison"]["current_day"]["costs"].get("cost_data_available", True),
+            "cost_total_text": format_cost_text(curr_costs.get("total_cost"), cost_currency),
+            "cost_available": curr_costs.get("cost_data_available", True),
         },
-        "summary_change": compare_data["comparison"]["summary_change"],
+        "summary_change": {
+            "tokens": compare_data["comparison"]["summary_change"]["tokens"],
+            "cost": {
+                "difference_text": format_cost_text(cost_change.get("difference"), cost_currency),
+                "rate_percent": cost_change.get("rate_percent")
+            }
+        },
         "top_models": top_models
     }
 
@@ -789,15 +808,20 @@ def generate_report_text(compare_data: dict[str, Any]) -> str:
 2. 값이 0이거나 변화가 없으면 담백하게 쓴다.
 3. 6문장 이내로 작성한다.
 4. 날짜는 KST 기준이라고 자연스럽게 반영한다.
-5. 금액 단위는 원으로 표기하되, 값이 없으면 비용 데이터 조회에 실패했다고 쓴다.
-6. 토큰은 input, output, total 순서로 언급한다.
-7. 모델별 정보가 있으면 변화가 큰 상위 모델 1~3개를 자연스럽게 언급한다.
-8. cost_data_available가 false이거나 cost_error가 있으면 비용 데이터는 일시적으로 조회되지 않았다고 안내하고 토큰 사용량 중심으로 작성한다.
-9. 문장마다 줄바꿈하기 좋게, 핵심 문장을 1문장씩 자연스럽게 끊어서 작성한다.
+5. 비용은 반드시 사용자가 준 문자열(cost_total_text, difference_text)을 그대로 사용한다.
+6. 비용 문자열을 원 단위 정수로 다시 변환하거나 천 단위로 재해석하지 않는다.
+7. 토큰은 input, output, total 순서로 언급한다.
+8. 모델별 정보가 있으면 변화가 큰 상위 모델 1~3개를 자연스럽게 언급한다.
+9. cost_data_available가 false이거나 cost_error가 있으면 비용 데이터는 일시적으로 조회되지 않았다고 안내하고 토큰 사용량 중심으로 작성한다.
+10. 문장마다 줄바꿈하기 좋게 핵심 문장을 1문장씩 자연스럽게 끊어서 작성한다.
 """
 
     user_prompt = f"""
 다음 JSON 데이터를 기반으로 Azure OpenAI 일일 리포트를 한국어로 작성해줘.
+
+중요:
+- 비용은 cost_total_text 와 difference_text 값을 그대로 사용해.
+- 예: "2.1503 KRW" 를 "2,150원" 으로 바꾸면 안 돼.
 
 데이터:
 {json.dumps(lightweight_data, ensure_ascii=False, indent=2)}
@@ -809,7 +833,7 @@ def generate_report_text(compare_data: dict[str, Any]) -> str:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
         ],
-        temperature=0.2,
+        temperature=0.1,
         max_tokens=500
     )
 
@@ -1127,4 +1151,3 @@ def daily_report_timer(mytimer: func.TimerRequest) -> None:
     except Exception:
         logging.exception("daily_report_timer failed")
         raise
-    
