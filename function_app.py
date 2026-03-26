@@ -508,8 +508,7 @@ def fetch_current_month_costs(
                 }
             },
             "grouping": [
-                {"type": "Dimension", "name": "ResourceId"},
-                {"type": "Dimension", "name": "UsageDate"},
+                {"type": "Dimension", "name": "ResourceId"}
             ]
         }
     }
@@ -527,13 +526,51 @@ def fetch_current_month_costs(
     if response.status_code != 200:
         raise RuntimeError(f"월간 Cost API 호출 실패: {response.status_code} / {response.text}")
 
-    parsed = parse_cost_response(response.json(), resource_ids, start_kst_str)
+    data = response.json()
+    properties = data.get("properties", {})
+    rows = properties.get("rows", [])
+    columns = properties.get("columns", [])
+
+    col_index = {}
+    for idx, col in enumerate(columns):
+        col_index[col.get("name")] = idx
+
+    resource_id_idx = col_index.get("ResourceId")
+    total_cost_idx = col_index.get("totalCost")
+    currency_idx = col_index.get("Currency")
+    usage_date_idx = col_index.get("UsageDate")
+
+    normalized_resource_ids = {x.lower(): x for x in resource_ids}
+
+    daily_rows = []
+    total_cost = 0.0
+    currency = None
+
+    for row in rows:
+        row_resource_id = str(row[resource_id_idx]).lower() if resource_id_idx is not None else ""
+        if resource_ids and row_resource_id not in normalized_resource_ids:
+            continue
+
+        cost_value = float(row[total_cost_idx]) if total_cost_idx is not None else 0.0
+        currency = row[currency_idx] if currency_idx is not None else currency
+        usage_date = str(row[usage_date_idx]) if usage_date_idx is not None else ""
+
+        daily_rows.append({
+            "usage_date": usage_date,
+            "resource_id": normalized_resource_ids.get(row_resource_id, row_resource_id),
+            "cost": cost_value,
+            "currency": currency
+        })
+
+        total_cost += cost_value
+
+    daily_rows.sort(key=lambda x: (x["usage_date"], x["resource_id"]))
 
     return {
         "period_kst": f"{start_kst_str} ~ {end_kst_str}",
-        "currency": parsed["currency"],
-        "total_cost": parsed["total_cost"],
-        "resource_costs": parsed["resource_costs"]
+        "currency": currency,
+        "total_cost": total_cost,
+        "daily_rows": daily_rows
     }
 
 
@@ -1085,3 +1122,4 @@ def daily_report_timer(mytimer: func.TimerRequest) -> None:
     except Exception:
         logging.exception("daily_report_timer failed")
         raise
+    
