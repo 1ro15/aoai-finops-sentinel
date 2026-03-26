@@ -104,6 +104,19 @@ def add_line_breaks(text: str) -> str:
     return result.strip()
 
 
+def find_column_index(columns: list[dict[str, Any]], *candidates: str) -> int | None:
+    normalized: dict[str, int] = {}
+    for idx, col in enumerate(columns):
+        name = str(col.get("name", "")).strip().lower()
+        normalized[name] = idx
+
+    for candidate in candidates:
+        idx = normalized.get(candidate.lower())
+        if idx is not None:
+            return idx
+    return None
+
+
 # -----------------------------
 # 리소스 설정
 # -----------------------------
@@ -356,14 +369,10 @@ def parse_cost_response(data: dict[str, Any], target_ids: list[str], fallback_da
     rows = properties.get("rows", [])
     columns = properties.get("columns", [])
 
-    col_index = {}
-    for idx, col in enumerate(columns):
-        col_index[col.get("name")] = idx
-
-    resource_id_idx = col_index.get("ResourceId")
-    total_cost_idx = col_index.get("totalCost")
-    currency_idx = col_index.get("Currency")
-    usage_date_idx = col_index.get("UsageDate")
+    resource_id_idx = find_column_index(columns, "ResourceId")
+    total_cost_idx = find_column_index(columns, "totalCost", "PreTaxCost")
+    currency_idx = find_column_index(columns, "Currency")
+    usage_date_idx = find_column_index(columns, "UsageDate")
 
     resource_costs = []
     total_cost = 0.0
@@ -531,14 +540,10 @@ def fetch_current_month_costs(
     rows = properties.get("rows", [])
     columns = properties.get("columns", [])
 
-    col_index = {}
-    for idx, col in enumerate(columns):
-        col_index[col.get("name")] = idx
-
-    resource_id_idx = col_index.get("ResourceId")
-    total_cost_idx = col_index.get("totalCost")
-    currency_idx = col_index.get("Currency")
-    usage_date_idx = col_index.get("UsageDate")
+    resource_id_idx = find_column_index(columns, "ResourceId")
+    total_cost_idx = find_column_index(columns, "totalCost", "PreTaxCost")
+    currency_idx = find_column_index(columns, "Currency")
+    usage_date_idx = find_column_index(columns, "UsageDate")
 
     normalized_resource_ids = {x.lower(): x for x in resource_ids}
 
