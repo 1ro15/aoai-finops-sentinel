@@ -70,8 +70,38 @@ def get_kst_day_range_to_utc(days_ago: int) -> tuple[datetime, datetime, str]:
     return start_utc, end_utc, str(target_date_kst)
 
 
+def get_kst_month_range_to_utc() -> tuple[datetime, datetime, str, str]:
+    now_kst = datetime.now(KST)
+    month_start_kst = datetime(now_kst.year, now_kst.month, 1, 0, 0, 0, tzinfo=KST)
+
+    if now_kst.month == 12:
+        next_month_kst = datetime(now_kst.year + 1, 1, 1, 0, 0, 0, tzinfo=KST)
+    else:
+        next_month_kst = datetime(now_kst.year, now_kst.month + 1, 1, 0, 0, 0, tzinfo=KST)
+
+    return (
+        month_start_kst.astimezone(timezone.utc),
+        next_month_kst.astimezone(timezone.utc),
+        month_start_kst.strftime("%Y-%m-%d"),
+        (next_month_kst - timedelta(days=1)).strftime("%Y-%m-%d"),
+    )
+
+
 def to_utc_z(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def add_line_breaks(text: str) -> str:
+    if not text:
+        return text
+
+    separators = [". ", "다. ", "니다. ", "! ", "? "]
+    result = text
+
+    for sep in separators:
+        result = result.replace(sep, sep.strip() + "\n")
+
+    return result.strip()
 
 
 # -----------------------------
@@ -129,10 +159,6 @@ def query_metric_split_by_deployment(
     start_time_utc: datetime,
     end_time_utc: datetime,
 ) -> list[dict[str, Any]]:
-    """
-    1차: ModelDeploymentName 기준 split 시도
-    2차: 실패하면 aggregate 조회 fallback
-    """
     token = get_azure_management_token(credential)
     url = f"https://management.azure.com{resource_id}/providers/microsoft.insights/metrics"
 
@@ -197,17 +223,10 @@ def query_metric_split_by_deployment(
                 fallback=deployment
             )
 
-            model_version = normalize_dimension_value(
-                metadata.get("ModelVersion")
-                or metadata.get("modelversion"),
-                fallback="-"
-            )
-
             rows.append({
                 "metric_name": metric_name_value,
                 "model_deployment_name": deployment,
                 "model_name": model_name,
-                "model_version": model_version,
                 "raw_dimensions": metadata,
                 "total": total_value,
             })
@@ -245,7 +264,6 @@ def query_all_metrics_for_resource(
                 "metric_name": row["metric_name"],
                 "model_deployment_name": row["model_deployment_name"],
                 "model_name": row["model_name"],
-                "model_version": row["model_version"],
                 "raw_dimensions": row["raw_dimensions"],
                 "total": row["total"],
             })
@@ -333,6 +351,49 @@ def fetch_day_metrics(
 # -----------------------------
 # 비용 조회
 # -----------------------------
+def parse_cost_response(data: dict[str, Any], target_ids: list[str], fallback_date: str) -> dict[str, Any]:
+    properties = data.get("properties", {})
+    rows = properties.get("rows", [])
+    columns = properties.get("columns", [])
+
+    col_index = {}
+    for idx, col in enumerate(columns):
+        col_index[col.get("name")] = idx
+
+    resource_id_idx = col_index.get("ResourceId")
+    total_cost_idx = col_index.get("totalCost")
+    currency_idx = col_index.get("Currency")
+    usage_date_idx = col_index.get("UsageDate")
+
+    resource_costs = []
+    total_cost = 0.0
+    currency = None
+
+    normalized_resource_ids = {x.lower(): x for x in target_ids}
+
+    for row in rows:
+        row_resource_id = str(row[resource_id_idx]).lower() if resource_id_idx is not None else ""
+        if target_ids and row_resource_id not in normalized_resource_ids:
+            continue
+
+        cost_value = float(row[total_cost_idx]) if total_cost_idx is not None else 0.0
+        currency = row[currency_idx] if currency_idx is not None else currency
+
+        resource_costs.append({
+            "resource_id": normalized_resource_ids.get(row_resource_id, row_resource_id),
+            "usage_date": str(row[usage_date_idx]) if usage_date_idx is not None else fallback_date,
+            "cost": cost_value,
+            "currency": currency
+        })
+        total_cost += cost_value
+
+    return {
+        "currency": currency,
+        "total_cost": total_cost,
+        "resource_costs": resource_costs
+    }
+
+
 def fetch_day_costs(
     credential: DefaultAzureCredential,
     subscription_id: str,
@@ -387,50 +448,14 @@ def fetch_day_costs(
         )
 
         if response.status_code == 200:
-            data = response.json()
-            properties = data.get("properties", {})
-            rows = properties.get("rows", [])
-            columns = properties.get("columns", [])
-
-            col_index = {}
-            for idx, col in enumerate(columns):
-                col_index[col.get("name")] = idx
-
-            resource_id_idx = col_index.get("ResourceId")
-            total_cost_idx = col_index.get("totalCost")
-            currency_idx = col_index.get("Currency")
-            usage_date_idx = col_index.get("UsageDate")
-
-            resource_costs = []
-            total_cost = 0
-            currency = None
-
-            normalized_resource_ids = {x.lower(): x for x in resource_ids}
-
-            for row in rows:
-                row_resource_id = str(row[resource_id_idx]).lower() if resource_id_idx is not None else ""
-                if row_resource_id not in normalized_resource_ids:
-                    continue
-
-                cost_value = float(row[total_cost_idx]) if total_cost_idx is not None else 0.0
-                currency = row[currency_idx] if currency_idx is not None else currency
-
-                resource_costs.append({
-                    "resource_id": normalized_resource_ids[row_resource_id],
-                    "usage_date": str(row[usage_date_idx]) if usage_date_idx is not None else target_date_kst,
-                    "cost": cost_value,
-                    "currency": currency
-                })
-
-                total_cost += cost_value
-
+            parsed = parse_cost_response(response.json(), resource_ids, target_date_kst)
             return {
                 "target_date_kst": target_date_kst,
                 "start_time_utc": start_utc.isoformat(),
                 "end_time_utc": end_utc.isoformat(),
-                "currency": currency,
-                "total_cost": total_cost,
-                "resource_costs": resource_costs,
+                "currency": parsed["currency"],
+                "total_cost": parsed["total_cost"],
+                "resource_costs": parsed["resource_costs"],
                 "cost_data_available": True
             }
 
@@ -452,6 +477,64 @@ def fetch_day_costs(
     raise RuntimeError(
         f"Cost API 호출 실패: {last_response.status_code} / {last_response.text}"
     )
+
+
+def fetch_current_month_costs(
+    credential: DefaultAzureCredential,
+    subscription_id: str,
+    resource_ids: list[str],
+) -> dict[str, Any]:
+    start_utc, end_utc, start_kst_str, end_kst_str = get_kst_month_range_to_utc()
+    token = credential.get_token("https://management.azure.com/.default").token
+
+    url = (
+        f"https://management.azure.com/subscriptions/{subscription_id}"
+        f"/providers/Microsoft.CostManagement/query?api-version=2025-03-01"
+    )
+
+    body = {
+        "type": "Usage",
+        "timeframe": "Custom",
+        "timePeriod": {
+            "from": start_utc.isoformat(),
+            "to": end_utc.isoformat()
+        },
+        "dataset": {
+            "granularity": "Daily",
+            "aggregation": {
+                "totalCost": {
+                    "name": "PreTaxCost",
+                    "function": "Sum"
+                }
+            },
+            "grouping": [
+                {"type": "Dimension", "name": "ResourceId"},
+                {"type": "Dimension", "name": "UsageDate"},
+            ]
+        }
+    }
+
+    response = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        },
+        json=body,
+        timeout=60
+    )
+
+    if response.status_code != 200:
+        raise RuntimeError(f"월간 Cost API 호출 실패: {response.status_code} / {response.text}")
+
+    parsed = parse_cost_response(response.json(), resource_ids, start_kst_str)
+
+    return {
+        "period_kst": f"{start_kst_str} ~ {end_kst_str}",
+        "currency": parsed["currency"],
+        "total_cost": parsed["total_cost"],
+        "resource_costs": parsed["resource_costs"]
+    }
 
 
 # -----------------------------
@@ -661,13 +744,14 @@ def generate_report_text(compare_data: dict[str, Any]) -> str:
 
 규칙:
 1. 과장하지 말고 데이터에 근거해서만 작성한다.
-2. 값이 0이거나 변화가 없으면 '변동이 없습니다'처럼 담백하게 쓴다.
+2. 값이 0이거나 변화가 없으면 담백하게 쓴다.
 3. 6문장 이내로 작성한다.
 4. 날짜는 KST 기준이라고 자연스럽게 반영한다.
 5. 금액 단위는 원으로 표기하되, 값이 없으면 비용 데이터 조회에 실패했다고 쓴다.
-6. 토큰은 input/output/total 순서로 언급하면 좋다.
+6. 토큰은 input, output, total 순서로 언급한다.
 7. 모델별 정보가 있으면 변화가 큰 상위 모델 1~3개를 자연스럽게 언급한다.
-8. cost_data_available가 false이거나 cost_error가 있으면, 비용 데이터는 일시적으로 조회되지 않았다고 안내하고 토큰 사용량 중심으로 리포트를 작성한다.
+8. cost_data_available가 false이거나 cost_error가 있으면 비용 데이터는 일시적으로 조회되지 않았다고 안내하고 토큰 사용량 중심으로 작성한다.
+9. 문장마다 줄바꿈하기 좋게, 핵심 문장을 1문장씩 자연스럽게 끊어서 작성한다.
 """
 
     user_prompt = f"""
@@ -687,7 +771,7 @@ def generate_report_text(compare_data: dict[str, Any]) -> str:
         max_tokens=500
     )
 
-    return response.choices[0].message.content.strip()
+    return add_line_breaks(response.choices[0].message.content.strip())
 
 
 # -----------------------------
@@ -708,16 +792,16 @@ def build_model_breakdown_html(compare_data: dict[str, Any]) -> str:
     for item in model_breakdown:
         rows_html += f"""
         <tr>
-          <td>{item["model_name"]}</td>
-          <td>{item["model_deployment_name"]}</td>
-          <td style="text-align:right;">{format_number(item["previous_day"]["prompt_tokens"])}</td>
-          <td style="text-align:right;">{format_number(item["current_day"]["prompt_tokens"])}</td>
-          <td style="text-align:right;">{format_number(item["previous_day"]["completion_tokens"])}</td>
-          <td style="text-align:right;">{format_number(item["current_day"]["completion_tokens"])}</td>
-          <td style="text-align:right;">{format_number(item["previous_day"]["total_tokens"])}</td>
-          <td style="text-align:right;">{format_number(item["current_day"]["total_tokens"])}</td>
-          <td style="text-align:right;">{format_number(item["change"]["total_tokens"]["difference"])}</td>
-          <td style="text-align:right;">{format_number(item["change"]["total_tokens"]["rate_percent"], 2)}%</td>
+          <td style="border:1px solid #d1d5db; padding:8px;">{item["model_name"]}</td>
+          <td style="border:1px solid #d1d5db; padding:8px;">{item["model_deployment_name"]}</td>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["previous_day"]["prompt_tokens"])}</td>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["current_day"]["prompt_tokens"])}</td>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["previous_day"]["completion_tokens"])}</td>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["current_day"]["completion_tokens"])}</td>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["previous_day"]["total_tokens"])}</td>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["current_day"]["total_tokens"])}</td>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["change"]["total_tokens"]["difference"])}</td>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["change"]["total_tokens"]["rate_percent"], 2)}%</td>
         </tr>
         """
 
@@ -949,6 +1033,30 @@ def daily_report_send(req: func.HttpRequest) -> func.HttpResponse:
         )
     except Exception as e:
         logging.exception("daily_report_send failed")
+        return func.HttpResponse(str(e), status_code=500, mimetype="text/plain")
+
+
+@app.route(route="monthly_cost_test", methods=["GET"])
+def monthly_cost_test(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        resources = load_resources()
+        credential = DefaultAzureCredential()
+        subscription_id = get_env("SUBSCRIPTION_ID")
+        resource_ids = [x["resource_id"] for x in resources]
+
+        result = fetch_current_month_costs(
+            credential=credential,
+            subscription_id=subscription_id,
+            resource_ids=resource_ids
+        )
+
+        return func.HttpResponse(
+            json.dumps(result, ensure_ascii=False, indent=2, default=str),
+            mimetype="application/json",
+            status_code=200
+        )
+    except Exception as e:
+        logging.exception("monthly_cost_test failed")
         return func.HttpResponse(str(e), status_code=500, mimetype="text/plain")
 
 
