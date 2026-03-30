@@ -149,16 +149,14 @@ def load_deployment_model_map() -> dict[str, str]:
     return result
 
 
-def resolve_model_name(raw_model_name: str | None, deployment_name: str, deployment_model_map: dict[str, str]) -> str:
-    normalized_raw = normalize_dimension_value(raw_model_name, fallback="")
-    if normalized_raw:
-        return normalized_raw
+def resolve_model_name(deployment_name: str, deployment_model_map: dict[str, str]) -> tuple[str, str]:
+    normalized_deployment = normalize_dimension_value(deployment_name)
 
-    mapped = deployment_model_map.get(deployment_name)
+    mapped = deployment_model_map.get(normalized_deployment)
     if mapped:
-        return mapped
+        return mapped, "deployment_model_map"
 
-    return deployment_name
+    return normalized_deployment, "deployment_name_fallback"
 
 
 # -----------------------------
@@ -195,13 +193,6 @@ def load_resources() -> list[dict[str, str]]:
 # -----------------------------
 # 메트릭 조회
 # -----------------------------
-METRIC_NAMES = [
-    "ProcessedPromptTokens",
-    "GeneratedTokens",
-    "TokenTransaction",
-]
-
-
 def get_azure_management_token(credential: DefaultAzureCredential) -> str:
     return credential.get_token("https://management.azure.com/.default").token
 
@@ -216,89 +207,124 @@ def extract_metadata_values(ts: dict[str, Any]) -> dict[str, str]:
     return result
 
 
-def make_dimension_filter(dimension_name: str | None) -> str | None:
-    if not dimension_name:
-        return None
-    return f"{dimension_name} eq '*'"
-
-
-def query_metric_by_dimension(
+def query_metric_split_by_deployment(
     credential: DefaultAzureCredential,
     resource_id: str,
     metric_name: str,
     start_time_utc: datetime,
     end_time_utc: datetime,
-    dimension_name: str | None,
-) -> dict[str, Any]:
+    deployment_model_map: dict[str, str],
+) -> list[dict[str, Any]]:
     token = get_azure_management_token(credential)
     url = f"https://management.azure.com{resource_id}/providers/microsoft.insights/metrics"
-    filter_expr = make_dimension_filter(dimension_name)
 
-    params = {
-        "api-version": "2018-01-01",
-        "metricnames": metric_name,
-        "timespan": f"{to_utc_z(start_time_utc)}/{to_utc_z(end_time_utc)}",
-        "interval": "P1D",
-        "aggregation": "Total",
-    }
-    if filter_expr:
-        params["$filter"] = filter_expr
+    def call_metrics_api(filter_expr: str | None = None) -> requests.Response:
+        params = {
+            "api-version": "2018-01-01",
+            "metricnames": metric_name,
+            "timespan": f"{to_utc_z(start_time_utc)}/{to_utc_z(end_time_utc)}",
+            "interval": "P1D",
+            "aggregation": "Total",
+        }
+        if filter_expr:
+            params["$filter"] = filter_expr
 
-    response = requests.get(
-        url,
-        headers={"Authorization": f"Bearer {token}"},
-        params=params,
-        timeout=60,
-    )
+        return requests.get(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            params=params,
+            timeout=60,
+        )
 
+    response = call_metrics_api("ModelDeploymentName eq '*'")
+
+    if response.status_code != 200:
+        logging.warning(
+            "Metrics split query failed. fallback to aggregate. metric=%s status=%s body=%s",
+            metric_name,
+            response.status_code,
+            response.text,
+        )
+        response = call_metrics_api()
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Metrics API 호출 실패: metric={metric_name}, status={response.status_code}, body={response.text}"
+        )
+
+    data = response.json()
     rows: list[dict[str, Any]] = []
-    payload: dict[str, Any] = {}
-    timeseries_count = 0
-    metadata_key_examples: set[str] = set()
 
-    if response.status_code == 200:
-        payload = response.json()
-        values = payload.get("value", []) or []
+    for metric in data.get("value", []) or []:
+        metric_name_value = ((metric.get("name") or {}).get("value")) or metric_name
 
-        for metric in values:
-            metric_name_value = (((metric.get("name") or {}).get("value")) or metric_name)
+        for ts in metric.get("timeseries", []) or []:
+            metadata = extract_metadata_values(ts)
 
-            for ts in metric.get("timeseries", []) or []:
-                timeseries_count += 1
-                metadata = extract_metadata_values(ts)
-                metadata_key_examples.update(metadata.keys())
+            total_value = 0
+            for point in ts.get("data", []) or []:
+                point_total = point.get("total")
+                if point_total is not None:
+                    total_value += point_total
 
-                total_value = 0.0
-                for point in ts.get("data", []) or []:
-                    point_total = point.get("total")
-                    if point_total is not None:
-                        total_value += float(point_total)
+            deployment = normalize_dimension_value(
+                metadata.get("ModelDeploymentName")
+                or metadata.get("modeldeploymentname"),
+                fallback="unknown"
+            )
 
-                dimension_value = None
-                if dimension_name:
-                    dimension_value = (
-                        metadata.get(dimension_name)
-                        or metadata.get(dimension_name.lower())
-                    )
+            model_name, resolution_source = resolve_model_name(deployment, deployment_model_map)
 
-                rows.append({
-                    "metric_name": metric_name_value,
-                    "dimension_name": dimension_name,
-                    "dimension_value": normalize_dimension_value(dimension_value),
-                    "raw_dimensions": metadata,
-                    "total": total_value,
-                })
+            rows.append({
+                "metric_name": metric_name_value,
+                "model_deployment_name": deployment,
+                "model_name": model_name,
+                "raw_dimensions": metadata,
+                "model_resolution_source": resolution_source,
+                "total": total_value,
+            })
 
-    return {
-        "metric_name": metric_name,
-        "dimension_name": dimension_name,
-        "filter_expr": filter_expr,
-        "status_code": response.status_code,
-        "rows": rows,
-        "timeseries_count": timeseries_count,
-        "metadata_key_examples": sorted(metadata_key_examples),
-        "body_preview": response.text[:2000] if response.status_code != 200 else None,
-    }
+    return rows
+
+
+def query_all_metrics_for_resource(
+    credential: DefaultAzureCredential,
+    resource: dict[str, str],
+    start_time_utc: datetime,
+    end_time_utc: datetime,
+    deployment_model_map: dict[str, str],
+) -> list[dict[str, Any]]:
+    metric_names = [
+        "ProcessedPromptTokens",
+        "GeneratedTokens",
+        "TokenTransaction",
+    ]
+
+    all_rows: list[dict[str, Any]] = []
+
+    for metric_name in metric_names:
+        metric_rows = query_metric_split_by_deployment(
+            credential=credential,
+            resource_id=resource["resource_id"],
+            metric_name=metric_name,
+            start_time_utc=start_time_utc,
+            end_time_utc=end_time_utc,
+            deployment_model_map=deployment_model_map,
+        )
+
+        for row in metric_rows:
+            all_rows.append({
+                "resource_id": resource["resource_id"],
+                "region": resource["region"],
+                "metric_name": row["metric_name"],
+                "model_deployment_name": row["model_deployment_name"],
+                "model_name": row["model_name"],
+                "raw_dimensions": row["raw_dimensions"],
+                "model_resolution_source": row["model_resolution_source"],
+                "total": row["total"],
+            })
+
+    return all_rows
 
 
 def metric_name_to_field(metric_name: str) -> str:
@@ -310,255 +336,81 @@ def metric_name_to_field(metric_name: str) -> str:
     return mapping.get(metric_name, metric_name)
 
 
-def aggregate_rows_by_dimension(
-    rows: list[dict[str, Any]],
-    resource_id: str,
-    region: str,
-    key_field_name: str,
-) -> list[dict[str, Any]]:
-    grouped: dict[str, dict[str, Any]] = {}
+def normalize_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[tuple, dict[str, Any]] = {}
 
     for row in rows:
-        key_value = row["dimension_value"]
-        item = grouped.setdefault(
-            key_value,
-            {
-                "resource_id": resource_id,
-                "region": region,
-                key_field_name: key_value,
-                "prompt_tokens": 0.0,
-                "completion_tokens": 0.0,
-                "total_tokens": 0.0,
-                "raw_dimensions_by_metric": {},
-            },
+        key = (
+            row["resource_id"],
+            row["region"],
+            row["model_deployment_name"],
+            row["model_name"],
         )
+
+        if key not in grouped:
+            grouped[key] = {
+                "resource_id": row["resource_id"],
+                "region": row["region"],
+                "model_deployment_name": row["model_deployment_name"],
+                "model_name": row["model_name"],
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "raw_dimensions": {"deployment_dimension": {}},
+                "model_resolution_source": row.get("model_resolution_source", "deployment_name_fallback"),
+            }
 
         field_name = metric_name_to_field(row["metric_name"])
         if field_name in ("prompt_tokens", "completion_tokens", "total_tokens"):
-            item[field_name] += row["total"]
-            item["raw_dimensions_by_metric"][row["metric_name"]] = row["raw_dimensions"]
+            grouped[key][field_name] += row["total"]
+
+        grouped[key]["raw_dimensions"]["deployment_dimension"][row["metric_name"]] = row.get("raw_dimensions", {})
+
+        if grouped[key]["model_resolution_source"] != "deployment_model_map":
+            grouped[key]["model_resolution_source"] = row.get("model_resolution_source", grouped[key]["model_resolution_source"])
 
     return list(grouped.values())
 
 
-def signature_tuple(item: dict[str, Any]) -> tuple[float, float, float]:
-    return (
-        float(item.get("prompt_tokens", 0) or 0),
-        float(item.get("completion_tokens", 0) or 0),
-        float(item.get("total_tokens", 0) or 0),
-    )
+def aggregate_by_model(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
 
-
-def is_zero_signature(sig: tuple[float, float, float]) -> bool:
-    return sig == (0.0, 0.0, 0.0)
-
-
-def build_signature_index(items: list[dict[str, Any]]) -> dict[tuple[float, float, float], list[dict[str, Any]]]:
-    index: dict[tuple[float, float, float], list[dict[str, Any]]] = {}
     for item in items:
-        index.setdefault(signature_tuple(item), []).append(item)
-    return index
+        model_name = item.get("model_name", "unknown")
 
+        if model_name not in grouped:
+            grouped[model_name] = {
+                "model_name": model_name,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "resource_count": 0,
+                "regions": set(),
+                "deployments": set(),
+                "resources": set(),
+                "resolution_sources": set(),
+            }
 
-def resolve_deployment_from_model_item(
-    model_item: dict[str, Any],
-    deployment_signature_index: dict[tuple[float, float, float], list[dict[str, Any]]],
-    deployment_model_map: dict[str, str],
-) -> tuple[str, str]:
-    raw_dimensions_by_metric = model_item.get("raw_dimensions_by_metric", {})
-    for metadata in raw_dimensions_by_metric.values():
-        deployment_name = metadata.get("ModelDeploymentName") or metadata.get("modeldeploymentname")
-        if deployment_name:
-            return normalize_dimension_value(deployment_name), "model_dimension_metadata"
+        grouped_model = grouped[model_name]
+        grouped_model["prompt_tokens"] += item.get("prompt_tokens", 0)
+        grouped_model["completion_tokens"] += item.get("completion_tokens", 0)
+        grouped_model["total_tokens"] += item.get("total_tokens", 0)
+        grouped_model["regions"].add(item.get("region", "unknown"))
+        grouped_model["deployments"].add(item.get("model_deployment_name", "unknown"))
+        grouped_model["resources"].add(item.get("resource_id", "unknown"))
+        grouped_model["resolution_sources"].add(item.get("model_resolution_source", "deployment_name_fallback"))
 
-    sig = signature_tuple(model_item)
-    if not is_zero_signature(sig):
-        candidates = deployment_signature_index.get(sig, [])
-        if len(candidates) == 1:
-            return normalize_dimension_value(candidates[0].get("model_deployment_name")), "deployment_signature_match"
+    results: list[dict[str, Any]] = []
+    for value in grouped.values():
+        value["regions"] = sorted(value["regions"])
+        value["deployments"] = sorted(value["deployments"])
+        value["resources"] = sorted(value["resources"])
+        value["resource_count"] = len(value["resources"])
+        value["resolution_sources"] = sorted(value["resolution_sources"])
+        results.append(value)
 
-    reverse_matches = [deployment for deployment, model in deployment_model_map.items() if model == model_item.get("model_name")]
-    if len(reverse_matches) == 1:
-        return normalize_dimension_value(reverse_matches[0]), "deployment_model_map_reverse_unique"
-
-    return "unknown", "deployment_unresolved"
-
-
-def resolve_model_from_deployment_item(
-    deployment_item: dict[str, Any],
-    model_signature_index: dict[tuple[float, float, float], list[dict[str, Any]]],
-    deployment_model_map: dict[str, str],
-) -> tuple[str, str]:
-    raw_dimensions_by_metric = deployment_item.get("raw_dimensions_by_metric", {})
-    for metadata in raw_dimensions_by_metric.values():
-        model_name = metadata.get("ModelName") or metadata.get("modelname")
-        if model_name:
-            return normalize_dimension_value(model_name), "deployment_dimension_metadata"
-
-    sig = signature_tuple(deployment_item)
-    if not is_zero_signature(sig):
-        candidates = model_signature_index.get(sig, [])
-        if len(candidates) == 1:
-            return normalize_dimension_value(candidates[0].get("model_name")), "model_signature_match"
-
-    mapped = deployment_model_map.get(deployment_item.get("model_deployment_name", ""))
-    if mapped:
-        return normalize_dimension_value(mapped), "deployment_model_map"
-
-    return normalize_dimension_value(deployment_item.get("model_deployment_name")), "deployment_name_fallback"
-
-
-def build_final_items_for_resource(
-    resource: dict[str, str],
-    model_rows: list[dict[str, Any]],
-    deployment_rows: list[dict[str, Any]],
-    deployment_model_map: dict[str, str],
-) -> list[dict[str, Any]]:
-    model_groups = aggregate_rows_by_dimension(
-        rows=model_rows,
-        resource_id=resource["resource_id"],
-        region=resource["region"],
-        key_field_name="model_name",
-    )
-    deployment_groups = aggregate_rows_by_dimension(
-        rows=deployment_rows,
-        resource_id=resource["resource_id"],
-        region=resource["region"],
-        key_field_name="model_deployment_name",
-    )
-
-    deployment_signature_index = build_signature_index(deployment_groups)
-    model_signature_index = build_signature_index(model_groups)
-
-    final_items: list[dict[str, Any]] = []
-
-    if model_groups:
-        for model_item in model_groups:
-            deployment_name, resolution_source = resolve_deployment_from_model_item(
-                model_item=model_item,
-                deployment_signature_index=deployment_signature_index,
-                deployment_model_map=deployment_model_map,
-            )
-
-            final_items.append({
-                "resource_id": resource["resource_id"],
-                "region": resource["region"],
-                "model_deployment_name": deployment_name,
-                "model_name": normalize_dimension_value(model_item.get("model_name")),
-                "prompt_tokens": model_item.get("prompt_tokens", 0.0),
-                "completion_tokens": model_item.get("completion_tokens", 0.0),
-                "total_tokens": model_item.get("total_tokens", 0.0),
-                "raw_dimensions": {
-                    "model_dimension": model_item.get("raw_dimensions_by_metric", {}),
-                    "deployment_dimension_match": deployment_name,
-                },
-                "model_resolution_source": resolution_source,
-            })
-
-        return final_items
-
-    for deployment_item in deployment_groups:
-        model_name, resolution_source = resolve_model_from_deployment_item(
-            deployment_item=deployment_item,
-            model_signature_index=model_signature_index,
-            deployment_model_map=deployment_model_map,
-        )
-
-        final_items.append({
-            "resource_id": resource["resource_id"],
-            "region": resource["region"],
-            "model_deployment_name": normalize_dimension_value(deployment_item.get("model_deployment_name")),
-            "model_name": model_name,
-            "prompt_tokens": deployment_item.get("prompt_tokens", 0.0),
-            "completion_tokens": deployment_item.get("completion_tokens", 0.0),
-            "total_tokens": deployment_item.get("total_tokens", 0.0),
-            "raw_dimensions": {
-                "deployment_dimension": deployment_item.get("raw_dimensions_by_metric", {}),
-            },
-            "model_resolution_source": resolution_source,
-        })
-
-    return final_items
-
-
-def query_all_metrics_for_resource(
-    credential: DefaultAzureCredential,
-    resource: dict[str, str],
-    start_time_utc: datetime,
-    end_time_utc: datetime,
-    deployment_model_map: dict[str, str],
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    model_rows: list[dict[str, Any]] = []
-    deployment_rows: list[dict[str, Any]] = []
-    debug_metrics: dict[str, Any] = {}
-
-    for metric_name in METRIC_NAMES:
-        model_result = query_metric_by_dimension(
-            credential=credential,
-            resource_id=resource["resource_id"],
-            metric_name=metric_name,
-            start_time_utc=start_time_utc,
-            end_time_utc=end_time_utc,
-            dimension_name="ModelName",
-        )
-        deployment_result = query_metric_by_dimension(
-            credential=credential,
-            resource_id=resource["resource_id"],
-            metric_name=metric_name,
-            start_time_utc=start_time_utc,
-            end_time_utc=end_time_utc,
-            dimension_name="ModelDeploymentName",
-        )
-
-        model_rows.extend(model_result["rows"])
-        deployment_rows.extend(deployment_result["rows"])
-
-        debug_metrics[metric_name] = {
-            "model_dimension": {
-                "status_code": model_result["status_code"],
-                "filter_expr": model_result["filter_expr"],
-                "timeseries_count": model_result["timeseries_count"],
-                "metadata_key_examples": model_result["metadata_key_examples"],
-                "sample_rows": model_result["rows"][:5],
-                "body_preview": model_result["body_preview"],
-            },
-            "deployment_dimension": {
-                "status_code": deployment_result["status_code"],
-                "filter_expr": deployment_result["filter_expr"],
-                "timeseries_count": deployment_result["timeseries_count"],
-                "metadata_key_examples": deployment_result["metadata_key_examples"],
-                "sample_rows": deployment_result["rows"][:5],
-                "body_preview": deployment_result["body_preview"],
-            },
-        }
-
-    final_items = build_final_items_for_resource(
-        resource=resource,
-        model_rows=model_rows,
-        deployment_rows=deployment_rows,
-        deployment_model_map=deployment_model_map,
-    )
-
-    debug_info = {
-        "resource_id": resource["resource_id"],
-        "region": resource["region"],
-        "metric_queries": debug_metrics,
-        "aggregated_model_groups": aggregate_rows_by_dimension(
-            rows=model_rows,
-            resource_id=resource["resource_id"],
-            region=resource["region"],
-            key_field_name="model_name",
-        ),
-        "aggregated_deployment_groups": aggregate_rows_by_dimension(
-            rows=deployment_rows,
-            resource_id=resource["resource_id"],
-            region=resource["region"],
-            key_field_name="model_deployment_name",
-        ),
-        "final_items": final_items,
-    }
-
-    return final_items, debug_info
+    results.sort(key=lambda x: (-(x.get("total_tokens", 0) or 0), x["model_name"]))
+    return results
 
 
 def sum_items(items: list[dict[str, Any]]) -> dict[str, float]:
@@ -574,40 +426,33 @@ def fetch_day_metrics(
     resources: list[dict[str, str]],
     days_ago: int,
     deployment_model_map: dict[str, str],
-    include_debug_info: bool = False,
 ) -> dict[str, Any]:
     start_utc, end_utc, target_date_kst = get_kst_day_range_to_utc(days_ago)
 
-    all_items: list[dict[str, Any]] = []
-    debug_resources: list[dict[str, Any]] = []
+    all_rows: list[dict[str, Any]] = []
 
     for resource in resources:
-        items, debug_info = query_all_metrics_for_resource(
+        rows = query_all_metrics_for_resource(
             credential=credential,
             resource=resource,
             start_time_utc=start_utc,
             end_time_utc=end_utc,
             deployment_model_map=deployment_model_map,
         )
-        all_items.extend(items)
-        if include_debug_info:
-            debug_resources.append(debug_info)
+        all_rows.extend(rows)
 
-    result = {
+    normalized = normalize_rows(all_rows)
+    model_summary = aggregate_by_model(normalized)
+    summary = sum_items(normalized)
+
+    return {
         "target_date_kst": target_date_kst,
         "start_time_utc": start_utc.isoformat(),
         "end_time_utc": end_utc.isoformat(),
-        "items": all_items,
-        "summary": sum_items(all_items),
+        "items": normalized,
+        "model_summary": model_summary,
+        "summary": summary,
     }
-
-    if include_debug_info:
-        result["debug_resources"] = debug_resources
-
-    return result
-# -----------------------------
-# 비용 조회
-# -----------------------------
 def parse_cost_response(data: dict[str, Any], target_ids: list[str], fallback_date: str) -> dict[str, Any]:
     properties = data.get("properties", {})
     rows = properties.get("rows", [])
@@ -826,13 +671,11 @@ def fetch_current_month_costs(
 # -----------------------------
 # 모델별 비교
 # -----------------------------
+# -----------------------------
+# 모델별 비교
+# -----------------------------
 def build_model_key(item: dict[str, Any]) -> tuple:
-    return (
-        item.get("resource_id", "unknown"),
-        item.get("region", "unknown"),
-        item.get("model_name", "unknown"),
-        item.get("model_deployment_name", "unknown"),
-    )
+    return (item.get("model_name", "unknown"),)
 
 
 def build_model_breakdown(
@@ -861,10 +704,75 @@ def build_model_breakdown(
         }
 
         result.append({
+            "model_name": key[0],
+            "previous_day": previous_day,
+            "current_day": current_day,
+            "regions": sorted(set(prev.get("regions", [])) | set(curr.get("regions", []))),
+            "deployments": sorted(set(prev.get("deployments", [])) | set(curr.get("deployments", []))),
+            "resource_count": max(prev.get("resource_count", 0), curr.get("resource_count", 0)),
+            "resolution_sources": sorted(set(prev.get("resolution_sources", [])) | set(curr.get("resolution_sources", []))),
+            "change": {
+                "prompt_tokens": calculate_change(
+                    current_day["prompt_tokens"], previous_day["prompt_tokens"]
+                ),
+                "completion_tokens": calculate_change(
+                    current_day["completion_tokens"], previous_day["completion_tokens"]
+                ),
+                "total_tokens": calculate_change(
+                    current_day["total_tokens"], previous_day["total_tokens"]
+                ),
+            }
+        })
+
+    result.sort(
+        key=lambda x: (
+            -(x["current_day"]["total_tokens"] or 0),
+            x["model_name"],
+        )
+    )
+
+    return result
+
+
+def build_deployment_breakdown(
+    previous_items: list[dict[str, Any]],
+    current_items: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    def deployment_key(item: dict[str, Any]) -> tuple:
+        return (
+            item.get("resource_id", "unknown"),
+            item.get("region", "unknown"),
+            item.get("model_name", "unknown"),
+            item.get("model_deployment_name", "unknown"),
+        )
+
+    previous_map = {deployment_key(item): item for item in previous_items}
+    current_map = {deployment_key(item): item for item in current_items}
+
+    all_keys = set(previous_map.keys()) | set(current_map.keys())
+    result = []
+
+    for key in all_keys:
+        prev = previous_map.get(key, {})
+        curr = current_map.get(key, {})
+
+        previous_day = {
+            "prompt_tokens": prev.get("prompt_tokens", 0),
+            "completion_tokens": prev.get("completion_tokens", 0),
+            "total_tokens": prev.get("total_tokens", 0),
+        }
+        current_day = {
+            "prompt_tokens": curr.get("prompt_tokens", 0),
+            "completion_tokens": curr.get("completion_tokens", 0),
+            "total_tokens": curr.get("total_tokens", 0),
+        }
+
+        result.append({
             "resource_id": key[0],
             "region": key[1],
             "model_name": key[2],
             "model_deployment_name": key[3],
+            "model_resolution_source": curr.get("model_resolution_source") or prev.get("model_resolution_source"),
             "previous_day": previous_day,
             "current_day": current_day,
             "change": {
@@ -917,6 +825,10 @@ def build_daily_compare_data() -> dict[str, Any]:
     )
 
     model_breakdown = build_model_breakdown(
+        d5_metrics["model_summary"],
+        d4_metrics["model_summary"]
+    )
+    deployment_breakdown = build_deployment_breakdown(
         d5_metrics["items"],
         d4_metrics["items"]
     )
@@ -972,6 +884,7 @@ def build_daily_compare_data() -> dict[str, Any]:
     return {
         "timezone": "KST",
         "resource_count": len(resources),
+        "deployment_model_map_count": len(deployment_model_map),
         "cost_error": cost_error,
         "comparison": {
             "previous_day": {
@@ -988,7 +901,8 @@ def build_daily_compare_data() -> dict[str, Any]:
                 "tokens": token_change,
                 "cost": cost_change
             },
-            "model_breakdown": model_breakdown
+            "model_breakdown": model_breakdown,
+            "deployment_breakdown": deployment_breakdown
         }
     }
 
@@ -1024,16 +938,19 @@ def generate_report_text(compare_data: dict[str, Any]) -> str:
     lightweight_data = {
         "timezone": compare_data["timezone"],
         "resource_count": compare_data["resource_count"],
+        "deployment_model_map_count": compare_data.get("deployment_model_map_count", 0),
         "cost_error": compare_data.get("cost_error"),
         "previous_day": {
             "date_kst": compare_data["comparison"]["previous_day"]["date_kst"],
             "summary": compare_data["comparison"]["previous_day"]["metrics"]["summary"],
+            "model_summary": compare_data["comparison"]["previous_day"]["metrics"].get("model_summary", [])[:10],
             "cost_total_text": format_cost_text(prev_costs.get("total_cost"), cost_currency),
             "cost_available": prev_costs.get("cost_data_available", True),
         },
         "current_day": {
             "date_kst": compare_data["comparison"]["current_day"]["date_kst"],
             "summary": compare_data["comparison"]["current_day"]["metrics"]["summary"],
+            "model_summary": compare_data["comparison"]["current_day"]["metrics"].get("model_summary", [])[:10],
             "cost_total_text": format_cost_text(curr_costs.get("total_cost"), cost_currency),
             "cost_available": curr_costs.get("cost_data_available", True),
         },
@@ -1059,9 +976,10 @@ def generate_report_text(compare_data: dict[str, Any]) -> str:
 5. 비용은 반드시 사용자가 준 문자열(cost_total_text, difference_text)을 그대로 사용한다.
 6. 비용 문자열을 원 단위 정수로 다시 변환하거나 천 단위로 재해석하지 않는다.
 7. 토큰은 input, output, total 순서로 언급한다.
-8. 모델별 정보가 있으면 변화가 큰 상위 모델 1~3개를 자연스럽게 언급한다.
+8. 모델별 정보가 있으면 canonical model 기준 상위 모델 1~3개를 자연스럽게 언급한다.
 9. cost_data_available가 false이거나 cost_error가 있으면 비용 데이터는 일시적으로 조회되지 않았다고 안내하고 토큰 사용량 중심으로 작성한다.
 10. 문장마다 줄바꿈하기 좋게 핵심 문장을 1문장씩 자연스럽게 끊어서 작성한다.
+11. 같은 모델이 여러 리전이나 여러 deployment에서 합산되었을 수 있음을 모델 요약에 자연스럽게 반영할 수 있다.
 """
 
     user_prompt = f"""
@@ -1070,6 +988,7 @@ def generate_report_text(compare_data: dict[str, Any]) -> str:
 중요:
 - 비용은 cost_total_text 와 difference_text 값을 그대로 사용해.
 - 예: "2.1503 KRW" 를 "2,150원" 으로 바꾸면 안 돼.
+- model_summary와 top_models는 deployment가 아니라 canonical model 기준 집계다.
 
 데이터:
 {json.dumps(lightweight_data, ensure_ascii=False, indent=2)}
@@ -1095,7 +1014,7 @@ def build_model_breakdown_html(compare_data: dict[str, Any]) -> str:
     model_breakdown = compare_data["comparison"].get("model_breakdown", [])
     if not model_breakdown:
         return """
-        <h3 style="margin:24px 0 8px;">모델별 토큰 비교</h3>
+        <h3 style="margin:24px 0 8px;">모델별 토큰 비교 (모델 기준 통합)</h3>
         <p>모델별 토큰 데이터가 없습니다.</p>
         """
 
@@ -1104,11 +1023,13 @@ def build_model_breakdown_html(compare_data: dict[str, Any]) -> str:
 
     rows_html = ""
     for item in model_breakdown:
+        regions = ", ".join(item.get("regions", [])) or "-"
+        deployments = ", ".join(item.get("deployments", [])) or "-"
         rows_html += f"""
         <tr>
-          <td style="border:1px solid #d1d5db; padding:8px;">{item["region"]}</td>
           <td style="border:1px solid #d1d5db; padding:8px;">{item["model_name"]}</td>
-          <td style="border:1px solid #d1d5db; padding:8px;">{item["model_deployment_name"]}</td>
+          <td style="border:1px solid #d1d5db; padding:8px;">{regions}</td>
+          <td style="border:1px solid #d1d5db; padding:8px;">{deployments}</td>
           <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["previous_day"]["prompt_tokens"])}</td>
           <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["current_day"]["prompt_tokens"])}</td>
           <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["previous_day"]["completion_tokens"])}</td>
@@ -1121,12 +1042,12 @@ def build_model_breakdown_html(compare_data: dict[str, Any]) -> str:
         """
 
     return f"""
-    <h3 style="margin:24px 0 8px;">모델별 토큰 비교</h3>
+    <h3 style="margin:24px 0 8px;">모델별 토큰 비교 (모델 기준 통합)</h3>
     <table style="border-collapse:collapse; width:100%; max-width:1200px; font-size:13px;">
       <tr style="background:#f3f4f6;">
-        <th style="border:1px solid #d1d5db; padding:8px;">리전</th>
         <th style="border:1px solid #d1d5db; padding:8px;">모델명</th>
-        <th style="border:1px solid #d1d5db; padding:8px;">배포명</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">리전</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">포함된 배포명</th>
         <th style="border:1px solid #d1d5db; padding:8px;">{prev_day} Input</th>
         <th style="border:1px solid #d1d5db; padding:8px;">{curr_day} Input</th>
         <th style="border:1px solid #d1d5db; padding:8px;">{prev_day} Output</th>
@@ -1135,6 +1056,50 @@ def build_model_breakdown_html(compare_data: dict[str, Any]) -> str:
         <th style="border:1px solid #d1d5db; padding:8px;">{curr_day} Total</th>
         <th style="border:1px solid #d1d5db; padding:8px;">Total 증감</th>
         <th style="border:1px solid #d1d5db; padding:8px;">Total 증감률</th>
+      </tr>
+      {rows_html}
+    </table>
+    """
+
+
+def build_deployment_breakdown_html(compare_data: dict[str, Any]) -> str:
+    deployment_breakdown = compare_data["comparison"].get("deployment_breakdown", [])
+    if not deployment_breakdown:
+        return """
+        <h3 style="margin:24px 0 8px;">리전/배포별 토큰 비교</h3>
+        <p>리전/배포별 토큰 데이터가 없습니다.</p>
+        """
+
+    prev_day = compare_data["comparison"]["previous_day"]["date_kst"]
+    curr_day = compare_data["comparison"]["current_day"]["date_kst"]
+
+    rows_html = ""
+    for item in deployment_breakdown:
+        rows_html += f"""
+        <tr>
+          <td style="border:1px solid #d1d5db; padding:8px;">{item["region"]}</td>
+          <td style="border:1px solid #d1d5db; padding:8px;">{item["model_name"]}</td>
+          <td style="border:1px solid #d1d5db; padding:8px;">{item["model_deployment_name"]}</td>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["previous_day"]["total_tokens"])}</td>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["current_day"]["total_tokens"])}</td>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["change"]["total_tokens"]["difference"])}</td>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["change"]["total_tokens"]["rate_percent"], 2)}%</td>
+          <td style="border:1px solid #d1d5db; padding:8px;">{item.get("model_resolution_source") or "-"}</td>
+        </tr>
+        """
+
+    return f"""
+    <h3 style="margin:24px 0 8px;">리전/배포별 Total 토큰 비교</h3>
+    <table style="border-collapse:collapse; width:100%; max-width:1200px; font-size:13px;">
+      <tr style="background:#f3f4f6;">
+        <th style="border:1px solid #d1d5db; padding:8px;">리전</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">모델명</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">배포명</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">{prev_day} Total</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">{curr_day} Total</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">Total 증감</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">Total 증감률</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">모델명 결정 방식</th>
       </tr>
       {rows_html}
     </table>
@@ -1176,24 +1141,21 @@ def build_email_html(report_text: str, compare_data: dict[str, Any]) -> str:
         """
 
     model_breakdown_section = build_model_breakdown_html(compare_data)
+    deployment_breakdown_section = build_deployment_breakdown_html(compare_data)
 
     html = f"""
     <html>
-      <body style="font-family: Arial, 'Malgun Gothic', sans-serif; line-height:1.6; color:#222; margin:0; padding:24px; background:#ffffff;">
-        <div style="max-width:1280px; margin:0 auto;">
-          <h2 style="margin:0 0 12px;">[AOAI FinOps Sentinel] Azure OpenAI 일일 비용 리포트</h2>
-
-          <p style="margin:0 0 20px;">
-            <strong>비교 기준:</strong><br>
-            {prev_day["date_kst"]} → {curr_day["date_kst"]} (KST)
+      <body style="font-family:Arial, sans-serif; color:#111; line-height:1.6;">
+        <div style="max-width:1200px; margin:0 auto; padding:24px;">
+          <h2 style="margin:0 0 12px;">AOAI FinOps Sentinel 일일 리포트</h2>
+          <p style="margin:0 0 24px; color:#555;">
+            기준 일자: {curr_day["date_kst"]} (KST)
           </p>
 
-          <h3 style="margin:24px 0 8px;">요약</h3>
-          <div style="white-space:pre-line; background:#f9fafb; border:1px solid #e5e7eb; padding:14px; border-radius:8px;">
-{report_text}
-          </div>
+          <h3 style="margin:0 0 8px;">요약</h3>
+          <p style="white-space:pre-wrap; margin:0 0 20px;">{report_text}</p>
 
-          <h3 style="margin:24px 0 8px;">전체 토큰 요약</h3>
+          <h3 style="margin:24px 0 8px;">토큰 요약</h3>
           <table style="border-collapse:collapse; width:100%; max-width:700px; font-size:13px;">
             <tr style="background:#f3f4f6;">
               <th style="border:1px solid #d1d5db; padding:8px;">항목</th>
@@ -1226,7 +1188,7 @@ def build_email_html(report_text: str, compare_data: dict[str, Any]) -> str:
           </table>
 
           {model_breakdown_section}
-
+          {deployment_breakdown_section}
           {cost_section}
 
           <p style="margin-top:28px; color:#666; font-size:12px;">
@@ -1237,49 +1199,6 @@ def build_email_html(report_text: str, compare_data: dict[str, Any]) -> str:
     </html>
     """
     return html
-
-
-# -----------------------------
-# 메일 발송
-# -----------------------------
-def send_email(subject: str, html_body: str) -> dict[str, Any]:
-    smtp_host = get_env("SMTP_HOST")
-    smtp_port = int(get_env("SMTP_PORT"))
-    smtp_username = get_env("SMTP_USERNAME")
-    smtp_password = get_env("SMTP_PASSWORD")
-    mail_from = get_env("MAIL_FROM")
-    mail_to_raw = get_env("MAIL_TO")
-
-    recipients = [x.strip() for x in mail_to_raw.split(",") if x.strip()]
-    if not recipients:
-        raise ValueError("MAIL_TO에 수신자가 없습니다.")
-
-    message = MIMEMultipart("alternative")
-    message["Subject"] = subject
-    message["From"] = mail_from
-    message["To"] = ", ".join(recipients)
-
-    message.attach(MIMEText(html_body, "html", "utf-8"))
-
-    logging.info("SMTP send start. host=%s port=%s to=%s", smtp_host, smtp_port, recipients)
-
-    with smtplib.SMTP(smtp_host, smtp_port, timeout=60) as server:
-        server.starttls()
-        server.login(smtp_username, smtp_password)
-        server.sendmail(mail_from, recipients, message.as_string())
-
-    logging.info("SMTP send success. subject=%s", subject)
-
-    return {
-        "success": True,
-        "recipients": recipients,
-        "subject": subject
-    }
-
-
-# -----------------------------
-# 실행
-# -----------------------------
 def execute_daily_report_send() -> dict[str, Any]:
     compare_data = build_daily_compare_data()
     report_text = generate_report_text(compare_data)
@@ -1295,43 +1214,6 @@ def execute_daily_report_send() -> dict[str, Any]:
         "send_result": send_result,
         "report_text": report_text,
         "compare_data": compare_data
-    }
-
-
-def parse_int_param(req: func.HttpRequest, name: str, default: int) -> int:
-    raw = req.params.get(name)
-    if raw is None or str(raw).strip() == "":
-        return default
-    return int(raw)
-
-
-def build_model_dimension_debug(days_ago: int = 4, resource_index: int | None = None) -> dict[str, Any]:
-    resources = load_resources()
-    if resource_index is not None:
-        if resource_index < 0 or resource_index >= len(resources):
-            raise ValueError(f"resource_index 범위 오류: 0 ~ {len(resources) - 1}")
-        resources = [resources[resource_index]]
-
-    deployment_model_map = load_deployment_model_map()
-    credential = DefaultAzureCredential()
-
-    metrics = fetch_day_metrics(
-        credential=credential,
-        resources=resources,
-        days_ago=days_ago,
-        deployment_model_map=deployment_model_map,
-        include_debug_info=True,
-    )
-
-    return {
-        "days_ago": days_ago,
-        "target_date_kst": metrics["target_date_kst"],
-        "start_time_utc": metrics["start_time_utc"],
-        "end_time_utc": metrics["end_time_utc"],
-        "resource_count": len(resources),
-        "items": metrics["items"],
-        "summary": metrics["summary"],
-        "debug_resources": metrics.get("debug_resources", []),
     }
 
 
@@ -1389,26 +1271,38 @@ def daily_report_send(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse(str(e), status_code=500, mimetype="text/plain")
 
 
-@app.route(route="model_dimension_debug", methods=["GET"])
-def model_dimension_debug(req: func.HttpRequest) -> func.HttpResponse:
+@app.route(route="model_rollup_debug", methods=["GET"])
+def model_rollup_debug(req: func.HttpRequest) -> func.HttpResponse:
     try:
-        days_ago = parse_int_param(req, "days_ago", 4)
-        resource_index_raw = req.params.get("resource_index")
-        resource_index = int(resource_index_raw) if resource_index_raw not in (None, "") else None
+        days_ago = int(req.params.get("days_ago", "4"))
+        resources = load_resources()
+        deployment_model_map = load_deployment_model_map()
+        credential = DefaultAzureCredential()
 
-        result = build_model_dimension_debug(
+        metrics = fetch_day_metrics(
+            credential=credential,
+            resources=resources,
             days_ago=days_ago,
-            resource_index=resource_index,
+            deployment_model_map=deployment_model_map,
         )
+
+        result = {
+            "days_ago": days_ago,
+            "target_date_kst": metrics["target_date_kst"],
+            "summary": metrics["summary"],
+            "model_summary": metrics["model_summary"],
+            "deployment_items": metrics["items"],
+            "deployment_model_map": deployment_model_map,
+        }
+
         return func.HttpResponse(
             json.dumps(result, ensure_ascii=False, indent=2, default=str),
             mimetype="application/json",
             status_code=200
         )
     except Exception as e:
-        logging.exception("model_dimension_debug failed")
+        logging.exception("model_rollup_debug failed")
         return func.HttpResponse(str(e), status_code=500, mimetype="text/plain")
-
 
 @app.route(route="monthly_cost_test", methods=["GET"])
 def monthly_cost_test(req: func.HttpRequest) -> func.HttpResponse:
@@ -1459,4 +1353,3 @@ def daily_report_timer(mytimer: func.TimerRequest) -> None:
     except Exception:
         logging.exception("daily_report_timer failed")
         raise
-    
