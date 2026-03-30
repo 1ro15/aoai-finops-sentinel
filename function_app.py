@@ -1066,7 +1066,7 @@ def build_deployment_breakdown_html(compare_data: dict[str, Any]) -> str:
     deployment_breakdown = compare_data["comparison"].get("deployment_breakdown", [])
     if not deployment_breakdown:
         return """
-        <h3 style="margin:24px 0 8px;">리전/배포별 토큰 비교 (상세)</h3>
+        <h3 style="margin:24px 0 8px;">리전/배포별 토큰 비교</h3>
         <p>리전/배포별 토큰 데이터가 없습니다.</p>
         """
 
@@ -1075,22 +1075,11 @@ def build_deployment_breakdown_html(compare_data: dict[str, Any]) -> str:
 
     rows_html = ""
     for item in deployment_breakdown:
-        model_name = item.get("model_name", "-") or "-"
-        deployment_name = item.get("model_deployment_name", "-") or "-"
-        if model_name == deployment_name:
-            deployment_display = deployment_name
-        else:
-            deployment_display = f"{deployment_name} (→ {model_name})"
-
         rows_html += f"""
         <tr>
           <td style="border:1px solid #d1d5db; padding:8px;">{item["region"]}</td>
-          <td style="border:1px solid #d1d5db; padding:8px;">{model_name}</td>
-          <td style="border:1px solid #d1d5db; padding:8px;">{deployment_display}</td>
-          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["previous_day"].get("prompt_tokens", 0))}</td>
-          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["current_day"].get("prompt_tokens", 0))}</td>
-          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["previous_day"].get("completion_tokens", 0))}</td>
-          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["current_day"].get("completion_tokens", 0))}</td>
+          <td style="border:1px solid #d1d5db; padding:8px;">{item["model_name"]}</td>
+          <td style="border:1px solid #d1d5db; padding:8px;">{item["model_deployment_name"]}</td>
           <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["previous_day"]["total_tokens"])}</td>
           <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["current_day"]["total_tokens"])}</td>
           <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["change"]["total_tokens"]["difference"])}</td>
@@ -1100,16 +1089,12 @@ def build_deployment_breakdown_html(compare_data: dict[str, Any]) -> str:
         """
 
     return f"""
-    <h3 style="margin:24px 0 8px;">리전/배포별 토큰 비교 (상세)</h3>
-    <table style="border-collapse:collapse; width:100%; max-width:1400px; font-size:13px;">
+    <h3 style="margin:24px 0 8px;">리전/배포별 Total 토큰 비교</h3>
+    <table style="border-collapse:collapse; width:100%; max-width:1200px; font-size:13px;">
       <tr style="background:#f3f4f6;">
         <th style="border:1px solid #d1d5db; padding:8px;">리전</th>
         <th style="border:1px solid #d1d5db; padding:8px;">모델명</th>
         <th style="border:1px solid #d1d5db; padding:8px;">배포명</th>
-        <th style="border:1px solid #d1d5db; padding:8px;">{prev_day} Input</th>
-        <th style="border:1px solid #d1d5db; padding:8px;">{curr_day} Input</th>
-        <th style="border:1px solid #d1d5db; padding:8px;">{prev_day} Output</th>
-        <th style="border:1px solid #d1d5db; padding:8px;">{curr_day} Output</th>
         <th style="border:1px solid #d1d5db; padding:8px;">{prev_day} Total</th>
         <th style="border:1px solid #d1d5db; padding:8px;">{curr_day} Total</th>
         <th style="border:1px solid #d1d5db; padding:8px;">Total 증감</th>
@@ -1214,6 +1199,49 @@ def build_email_html(report_text: str, compare_data: dict[str, Any]) -> str:
     </html>
     """
     return html
+
+
+def send_email(subject: str, html_body: str) -> dict[str, Any]:
+    mail_from = get_env("MAIL_FROM")
+    mail_to_raw = get_env("MAIL_TO")
+    smtp_host = get_env("SMTP_HOST")
+    smtp_port = int(get_env("SMTP_PORT"))
+    smtp_username = get_env("SMTP_USERNAME")
+    smtp_password = get_env("SMTP_PASSWORD")
+
+    recipients = [addr.strip() for addr in mail_to_raw.split(",") if addr.strip()]
+    if not recipients:
+        raise ValueError("MAIL_TO에 유효한 수신자가 없습니다.")
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = mail_from
+    msg["To"] = ", ".join(recipients)
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    try:
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
+            server.ehlo()
+            try:
+                server.starttls()
+                server.ehlo()
+            except Exception:
+                logging.info("SMTP STARTTLS not available. proceeding without TLS.")
+
+            server.login(smtp_username, smtp_password)
+            server.sendmail(mail_from, recipients, msg.as_string())
+    except Exception as e:
+        logging.exception("send_email failed")
+        raise RuntimeError(f"메일 발송 실패: {e}")
+
+    return {
+        "status": "sent",
+        "from": mail_from,
+        "to": recipients,
+        "smtp_host": smtp_host,
+        "smtp_port": smtp_port,
+    }
+
 def execute_daily_report_send() -> dict[str, Any]:
     compare_data = build_daily_compare_data()
     report_text = generate_report_text(compare_data)
