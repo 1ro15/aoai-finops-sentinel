@@ -1199,6 +1199,53 @@ def build_email_html(report_text: str, compare_data: dict[str, Any]) -> str:
     </html>
     """
     return html
+
+def send_email(subject: str, html_body: str) -> dict[str, Any]:
+    smtp_host = os.getenv("SMTP_HOST", "").strip()
+    smtp_port = int(os.getenv("SMTP_PORT", "587").strip() or "587")
+    smtp_username = os.getenv("SMTP_USERNAME", "").strip()
+    smtp_password = os.getenv("SMTP_PASSWORD", "").strip()
+    mail_from = os.getenv("MAIL_FROM", "").strip()
+    mail_to_raw = os.getenv("MAIL_TO", "").strip()
+
+    missing = [
+        name for name, value in [
+            ("SMTP_HOST", smtp_host),
+            ("SMTP_PORT", str(smtp_port)),
+            ("SMTP_USERNAME", smtp_username),
+            ("SMTP_PASSWORD", smtp_password),
+            ("MAIL_FROM", mail_from),
+            ("MAIL_TO", mail_to_raw),
+        ] if not value
+    ]
+    if missing:
+        raise ValueError(f"필수 메일 환경 변수가 없습니다: {', '.join(missing)}")
+
+    recipients = [addr.strip() for addr in mail_to_raw.split(",") if addr.strip()]
+    if not recipients:
+        raise ValueError("MAIL_TO에 유효한 수신자 주소가 없습니다.")
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = mail_from
+    msg["To"] = ", ".join(recipients)
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
+        server.starttls()
+        server.login(smtp_username, smtp_password)
+        server.sendmail(mail_from, recipients, msg.as_string())
+
+    return {
+        "status": "sent",
+        "smtp_host": smtp_host,
+        "smtp_port": smtp_port,
+        "recipient_count": len(recipients),
+        "recipients": recipients,
+        "from": mail_from,
+        "auth_user": smtp_username,
+    }
+
 def execute_daily_report_send() -> dict[str, Any]:
     compare_data = build_daily_compare_data()
     report_text = generate_report_text(compare_data)
