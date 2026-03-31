@@ -1027,36 +1027,57 @@ def build_model_breakdown_html(compare_data: dict[str, Any]) -> str:
         deployments = ", ".join(item.get("deployments", [])) or "-"
         rows_html += f"""
         <tr>
-          <td style="border:1px solid #d1d5db; padding:8px;">{item["model_name"]}</td>
+          <th style="border:1px solid #d1d5db; padding:8px; background:#f9fafb; width:140px;">모델명</th>
+          <td style="border:1px solid #d1d5db; padding:8px; font-weight:600;">{item["model_name"]}</td>
+          <th style="border:1px solid #d1d5db; padding:8px; background:#f9fafb; width:120px;">리전</th>
           <td style="border:1px solid #d1d5db; padding:8px;">{regions}</td>
-          <td style="border:1px solid #d1d5db; padding:8px;">{deployments}</td>
+        </tr>
+        <tr>
+          <th style="border:1px solid #d1d5db; padding:8px; background:#f9fafb;">포함된 배포명</th>
+          <td colspan="3" style="border:1px solid #d1d5db; padding:8px;">{deployments}</td>
+        </tr>
+        <tr>
+          <th style="border:1px solid #d1d5db; padding:8px; background:#f9fafb;">{prev_day} Input</th>
           <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["previous_day"]["prompt_tokens"])}</td>
+          <th style="border:1px solid #d1d5db; padding:8px; background:#f9fafb;">{curr_day} Input</th>
           <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["current_day"]["prompt_tokens"])}</td>
+        </tr>
+        <tr>
+          <th style="border:1px solid #d1d5db; padding:8px; background:#f9fafb;">Input 증감</th>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["change"]["prompt_tokens"]["difference"])}</td>
+          <th style="border:1px solid #d1d5db; padding:8px; background:#f9fafb;">Input 증감률</th>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["change"]["prompt_tokens"]["rate_percent"], 2)}%</td>
+        </tr>
+        <tr>
+          <th style="border:1px solid #d1d5db; padding:8px; background:#f9fafb;">{prev_day} Output</th>
           <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["previous_day"]["completion_tokens"])}</td>
+          <th style="border:1px solid #d1d5db; padding:8px; background:#f9fafb;">{curr_day} Output</th>
           <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["current_day"]["completion_tokens"])}</td>
+        </tr>
+        <tr>
+          <th style="border:1px solid #d1d5db; padding:8px; background:#f9fafb;">Output 증감</th>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["change"]["completion_tokens"]["difference"])}</td>
+          <th style="border:1px solid #d1d5db; padding:8px; background:#f9fafb;">Output 증감률</th>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["change"]["completion_tokens"]["rate_percent"], 2)}%</td>
+        </tr>
+        <tr>
+          <th style="border:1px solid #d1d5db; padding:8px; background:#f9fafb;">{prev_day} Total</th>
           <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["previous_day"]["total_tokens"])}</td>
+          <th style="border:1px solid #d1d5db; padding:8px; background:#f9fafb;">{curr_day} Total</th>
           <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["current_day"]["total_tokens"])}</td>
+        </tr>
+        <tr>
+          <th style="border:1px solid #d1d5db; padding:8px; background:#f9fafb;">Total 증감</th>
           <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["change"]["total_tokens"]["difference"])}</td>
+          <th style="border:1px solid #d1d5db; padding:8px; background:#f9fafb;">Total 증감률</th>
           <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["change"]["total_tokens"]["rate_percent"], 2)}%</td>
         </tr>
+        <tr><td colspan="4" style="border:none; height:12px;"></td></tr>
         """
 
     return f"""
     <h3 style="margin:24px 0 8px;">모델별 토큰 비교 (모델 기준 통합)</h3>
-    <table style="border-collapse:collapse; width:100%; max-width:1200px; font-size:13px;">
-      <tr style="background:#f3f4f6;">
-        <th style="border:1px solid #d1d5db; padding:8px;">모델명</th>
-        <th style="border:1px solid #d1d5db; padding:8px;">리전</th>
-        <th style="border:1px solid #d1d5db; padding:8px;">포함된 배포명</th>
-        <th style="border:1px solid #d1d5db; padding:8px;">{prev_day} Input</th>
-        <th style="border:1px solid #d1d5db; padding:8px;">{curr_day} Input</th>
-        <th style="border:1px solid #d1d5db; padding:8px;">{prev_day} Output</th>
-        <th style="border:1px solid #d1d5db; padding:8px;">{curr_day} Output</th>
-        <th style="border:1px solid #d1d5db; padding:8px;">{prev_day} Total</th>
-        <th style="border:1px solid #d1d5db; padding:8px;">{curr_day} Total</th>
-        <th style="border:1px solid #d1d5db; padding:8px;">Total 증감</th>
-        <th style="border:1px solid #d1d5db; padding:8px;">Total 증감률</th>
-      </tr>
+    <table style="border-collapse:collapse; width:100%; max-width:900px; font-size:13px;">
       {rows_html}
     </table>
     """
@@ -1066,7 +1087,7 @@ def build_deployment_breakdown_html(compare_data: dict[str, Any]) -> str:
     deployment_breakdown = compare_data["comparison"].get("deployment_breakdown", [])
     if not deployment_breakdown:
         return """
-        <h3 style="margin:24px 0 8px;">리전/배포별 토큰 비교</h3>
+        <h3 style="margin:24px 0 8px;">리전/배포별 Total 토큰 비교</h3>
         <p>리전/배포별 토큰 데이터가 없습니다.</p>
         """
 
@@ -1084,7 +1105,6 @@ def build_deployment_breakdown_html(compare_data: dict[str, Any]) -> str:
           <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["current_day"]["total_tokens"])}</td>
           <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["change"]["total_tokens"]["difference"])}</td>
           <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["change"]["total_tokens"]["rate_percent"], 2)}%</td>
-          <td style="border:1px solid #d1d5db; padding:8px;">{item.get("model_resolution_source") or "-"}</td>
         </tr>
         """
 
@@ -1099,7 +1119,6 @@ def build_deployment_breakdown_html(compare_data: dict[str, Any]) -> str:
         <th style="border:1px solid #d1d5db; padding:8px;">{curr_day} Total</th>
         <th style="border:1px solid #d1d5db; padding:8px;">Total 증감</th>
         <th style="border:1px solid #d1d5db; padding:8px;">Total 증감률</th>
-        <th style="border:1px solid #d1d5db; padding:8px;">모델명 결정 방식</th>
       </tr>
       {rows_html}
     </table>
