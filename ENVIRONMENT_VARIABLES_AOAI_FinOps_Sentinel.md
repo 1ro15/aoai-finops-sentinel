@@ -56,7 +56,40 @@ gpt-4o-mini
 
 ---
 
-## 3. 비용 조회
+## 3. 모델 분리 및 통합 집계
+### `AOAI_DEPLOYMENT_MODEL_MAP`
+형식:
+- **한 줄 JSON 문자열**
+- `ModelDeploymentName` 을 기준으로 **대표 모델명(canonical model name)** 으로 매핑
+- 토큰 메트릭은 `ModelName` 차원 조회가 되지 않아, 리전별/배포별로 다른 배포명을 동일 모델로 합산하기 위해 사용
+
+예시:
+```json
+{"gpt-4o-mini":"gpt-4o-mini","gpt-4o-mini-jp":"gpt-4o-mini","gpt-4o":"gpt-4o"}
+```
+
+설명:
+- 동일 모델이 리전별로 다른 배포명으로 운영될 때, 보고서에서는 하나의 모델로 합산하기 위한 매핑
+- 예:
+  - East US 배포명 `gpt-4o-mini` → 대표 모델명 `gpt-4o-mini`
+  - Japan East 배포명 `gpt-4o-mini-jp` → 대표 모델명 `gpt-4o-mini`
+- 메일 보고서의 **모델별 토큰 비교(모델 기준 통합)**, API 응답의 `model_summary` 에 이 값이 반영됨
+
+주의:
+- **줄바꿈 없이 한 줄**로 넣기
+- key 는 실제 배포명(`ModelDeploymentName`)
+- value 는 최종 통합 기준이 되는 대표 모델명
+- 신규 리전/신규 배포 추가 시 반드시 같이 업데이트
+- 매핑이 없으면 코드에서 배포명을 그대로 모델명으로 사용하므로, 동일 모델 합산이 되지 않을 수 있음
+
+운영 예시:
+```json
+{"gpt-4o-mini":"gpt-4o-mini","gpt-4o-mini-jp":"gpt-4o-mini","gpt-4o-mini-eu":"gpt-4o-mini","gpt-4o":"gpt-4o"}
+```
+
+---
+
+## 4. 비용 조회
 ### `SUBSCRIPTION_ID`
 예시:
 ```text
@@ -68,7 +101,7 @@ gpt-4o-mini
 
 ---
 
-## 4. 메일 발송(SMTP)
+## 5. 메일 발송(SMTP)
 ### `SMTP_HOST`
 예시:
 ```text
@@ -98,7 +131,7 @@ abcdefghijklmnop
 설명:
 - Gmail 테스트 시 **앱 비밀번호(16자리)**
 - 일반 Gmail 로그인 비밀번호 아님
-- 앱 비밀번호는 2단계 인증이 켜진 계정에서만 생성 가능. Google 도움말도 2단계 인증이 켜진 계정에서 앱 비밀번호를 생성할 수 있다고 안내합니다. citeturn654677view1
+- 앱 비밀번호는 2단계 인증이 켜진 계정에서만 생성 가능
 
 ### `MAIL_FROM`
 예시:
@@ -121,7 +154,7 @@ user1@naver.com,user2@gmail.com
 
 ---
 
-## 5. 자동 실행 스케줄
+## 6. 자동 실행 스케줄
 ### `DAILY_REPORT_SCHEDULE`
 설명:
 - Azure Functions Timer Trigger 스케줄
@@ -144,12 +177,13 @@ user1@naver.com,user2@gmail.com
 
 ---
 
-## 6. 현재 사용 중인 대표 환경 변수 목록 요약
+## 7. 현재 사용 중인 대표 환경 변수 목록 요약
 ```text
 AZURE_OPENAI_ENDPOINT
 AZURE_OPENAI_DEPLOYMENT_NAME
 AZURE_CLIENT_ID
 AOAI_RESOURCE_IDS
+AOAI_DEPLOYMENT_MODEL_MAP
 SUBSCRIPTION_ID
 SMTP_HOST
 SMTP_PORT
@@ -162,7 +196,7 @@ DAILY_REPORT_SCHEDULE
 
 ---
 
-## 7. GitHub에 올리면 안 되는 값
+## 8. GitHub에 올리면 안 되는 값
 다음 값들은 저장소에 올리면 안 됩니다.
 - `SMTP_PASSWORD`
 - `AZURE_CLIENT_ID` 자체는 올려도 큰 비밀은 아니지만, 보통 환경 변수 파일에 하드코딩하지 않는 것이 좋음
