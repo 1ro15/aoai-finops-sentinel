@@ -287,6 +287,92 @@ def query_metric_split_by_deployment(
     return rows
 
 
+
+def query_metric_debug(
+    credential: DefaultAzureCredential,
+    resource_id: str,
+    metric_name: str,
+    start_time_utc: datetime,
+    end_time_utc: datetime,
+    dimension_name: str | None = None,
+) -> dict[str, Any]:
+    token = get_azure_management_token(credential)
+    url = f"https://management.azure.com{resource_id}/providers/microsoft.insights/metrics"
+
+    params = {
+        "api-version": "2018-01-01",
+        "metricnames": metric_name,
+        "timespan": f"{to_utc_z(start_time_utc)}/{to_utc_z(end_time_utc)}",
+        "interval": "P1D",
+        "aggregation": "Total",
+    }
+    if dimension_name:
+        params["$filter"] = f"{dimension_name} eq '*'"
+
+    response = requests.get(
+        url,
+        headers={"Authorization": f"Bearer {token}"},
+        params=params,
+        timeout=60,
+    )
+
+    result: dict[str, Any] = {
+        "metric_name": metric_name,
+        "dimension_name": dimension_name,
+        "filter_expr": params.get("$filter"),
+        "status_code": response.status_code,
+        "timeseries_count": 0,
+        "metadata_key_examples": [],
+        "sample_rows": [],
+        "body_preview": None,
+    }
+
+    if response.status_code != 200:
+        result["body_preview"] = response.text[:2000]
+        return result
+
+    data = response.json()
+    metadata_keys = set()
+    sample_rows: list[dict[str, Any]] = []
+    timeseries_count = 0
+
+    for metric in data.get("value", []) or []:
+        metric_name_value = ((metric.get("name") or {}).get("value")) or metric_name
+
+        for ts in metric.get("timeseries", []) or []:
+            timeseries_count += 1
+            metadata = extract_metadata_values(ts)
+            metadata_keys.update(metadata.keys())
+
+            total_value = 0
+            for point in ts.get("data", []) or []:
+                point_total = point.get("total")
+                if point_total is not None:
+                    total_value += point_total
+
+            dimension_value = None
+            if dimension_name:
+                dimension_value = metadata.get(dimension_name) or metadata.get(dimension_name.lower())
+            if not dimension_value:
+                if metadata:
+                    first_key = next(iter(metadata.keys()))
+                    dimension_value = metadata.get(first_key)
+
+            if len(sample_rows) < 10:
+                sample_rows.append({
+                    "metric_name": metric_name_value,
+                    "dimension_name": dimension_name,
+                    "dimension_value": normalize_dimension_value(dimension_value, fallback="(none)"),
+                    "raw_dimensions": metadata,
+                    "total": total_value,
+                })
+
+    result["timeseries_count"] = timeseries_count
+    result["metadata_key_examples"] = sorted(metadata_keys)[:20]
+    result["sample_rows"] = sample_rows
+    return result
+
+
 def query_all_metrics_for_resource(
     credential: DefaultAzureCredential,
     resource: dict[str, str],
@@ -1365,6 +1451,75 @@ def model_rollup_debug(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as e:
         logging.exception("model_rollup_debug failed")
         return func.HttpResponse(str(e), status_code=500, mimetype="text/plain")
+
+
+@app.route(route="request_metric_debug", methods=["GET"])
+def request_metric_debug(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        days_ago = int(req.params.get("days_ago", "4"))
+        resource_index = req.params.get("resource_index")
+        metric_param = (req.params.get("metrics") or "Requests,CallCount").strip()
+        dimension_param = (req.params.get("dimensions") or "ModelDeploymentName,ModelName,ApiName,ModelVersion,Region,none").strip()
+
+        metric_candidates = [x.strip() for x in metric_param.split(",") if x.strip()]
+        dimensions_raw = [x.strip() for x in dimension_param.split(",") if x.strip()]
+        dimensions: list[str | None] = []
+        for x in dimensions_raw:
+            if x.lower() in ("none", "null", "aggregate"):
+                dimensions.append(None)
+            else:
+                dimensions.append(x)
+
+        resources = load_resources()
+        if resource_index is not None:
+            selected_idx = int(resource_index)
+            resources = [resources[selected_idx]]
+
+        credential = DefaultAzureCredential()
+        start_time_utc, end_time_utc, target_date_kst = get_kst_day_range_to_utc(days_ago)
+
+        debug_resources: list[dict[str, Any]] = []
+        for resource in resources:
+            metric_results: dict[str, Any] = {}
+            for metric_name in metric_candidates:
+                per_dimension: dict[str, Any] = {}
+                for dimension_name in dimensions:
+                    key = "aggregate" if dimension_name is None else dimension_name
+                    per_dimension[key] = query_metric_debug(
+                        credential=credential,
+                        resource_id=resource["resource_id"],
+                        metric_name=metric_name,
+                        start_time_utc=start_time_utc,
+                        end_time_utc=end_time_utc,
+                        dimension_name=dimension_name,
+                    )
+                metric_results[metric_name] = per_dimension
+
+            debug_resources.append({
+                "resource_id": resource["resource_id"],
+                "region": resource["region"],
+                "metric_results": metric_results,
+            })
+
+        result = {
+            "days_ago": days_ago,
+            "target_date_kst": target_date_kst,
+            "start_time_utc": start_time_utc,
+            "end_time_utc": end_time_utc,
+            "metric_candidates": metric_candidates,
+            "dimension_candidates": ["aggregate" if x is None else x for x in dimensions],
+            "debug_resources": debug_resources,
+        }
+
+        return func.HttpResponse(
+            json.dumps(result, ensure_ascii=False, indent=2, default=str),
+            mimetype="application/json",
+            status_code=200
+        )
+    except Exception as e:
+        logging.exception("request_metric_debug failed")
+        return func.HttpResponse(str(e), status_code=500, mimetype="text/plain")
+
 
 @app.route(route="monthly_cost_test", methods=["GET"])
 def monthly_cost_test(req: func.HttpRequest) -> func.HttpResponse:
