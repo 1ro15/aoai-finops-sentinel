@@ -287,92 +287,6 @@ def query_metric_split_by_deployment(
     return rows
 
 
-
-def query_metric_debug(
-    credential: DefaultAzureCredential,
-    resource_id: str,
-    metric_name: str,
-    start_time_utc: datetime,
-    end_time_utc: datetime,
-    dimension_name: str | None = None,
-) -> dict[str, Any]:
-    token = get_azure_management_token(credential)
-    url = f"https://management.azure.com{resource_id}/providers/microsoft.insights/metrics"
-
-    params = {
-        "api-version": "2018-01-01",
-        "metricnames": metric_name,
-        "timespan": f"{to_utc_z(start_time_utc)}/{to_utc_z(end_time_utc)}",
-        "interval": "P1D",
-        "aggregation": "Total",
-    }
-    if dimension_name:
-        params["$filter"] = f"{dimension_name} eq '*'"
-
-    response = requests.get(
-        url,
-        headers={"Authorization": f"Bearer {token}"},
-        params=params,
-        timeout=60,
-    )
-
-    result: dict[str, Any] = {
-        "metric_name": metric_name,
-        "dimension_name": dimension_name,
-        "filter_expr": params.get("$filter"),
-        "status_code": response.status_code,
-        "timeseries_count": 0,
-        "metadata_key_examples": [],
-        "sample_rows": [],
-        "body_preview": None,
-    }
-
-    if response.status_code != 200:
-        result["body_preview"] = response.text[:2000]
-        return result
-
-    data = response.json()
-    metadata_keys = set()
-    sample_rows: list[dict[str, Any]] = []
-    timeseries_count = 0
-
-    for metric in data.get("value", []) or []:
-        metric_name_value = ((metric.get("name") or {}).get("value")) or metric_name
-
-        for ts in metric.get("timeseries", []) or []:
-            timeseries_count += 1
-            metadata = extract_metadata_values(ts)
-            metadata_keys.update(metadata.keys())
-
-            total_value = 0
-            for point in ts.get("data", []) or []:
-                point_total = point.get("total")
-                if point_total is not None:
-                    total_value += point_total
-
-            dimension_value = None
-            if dimension_name:
-                dimension_value = metadata.get(dimension_name) or metadata.get(dimension_name.lower())
-            if not dimension_value:
-                if metadata:
-                    first_key = next(iter(metadata.keys()))
-                    dimension_value = metadata.get(first_key)
-
-            if len(sample_rows) < 10:
-                sample_rows.append({
-                    "metric_name": metric_name_value,
-                    "dimension_name": dimension_name,
-                    "dimension_value": normalize_dimension_value(dimension_value, fallback="(none)"),
-                    "raw_dimensions": metadata,
-                    "total": total_value,
-                })
-
-    result["timeseries_count"] = timeseries_count
-    result["metadata_key_examples"] = sorted(metadata_keys)[:20]
-    result["sample_rows"] = sample_rows
-    return result
-
-
 def query_all_metrics_for_resource(
     credential: DefaultAzureCredential,
     resource: dict[str, str],
@@ -384,6 +298,7 @@ def query_all_metrics_for_resource(
         "ProcessedPromptTokens",
         "GeneratedTokens",
         "TokenTransaction",
+        "AzureOpenAIRequests",
     ]
 
     all_rows: list[dict[str, Any]] = []
@@ -418,6 +333,7 @@ def metric_name_to_field(metric_name: str) -> str:
         "ProcessedPromptTokens": "prompt_tokens",
         "GeneratedTokens": "completion_tokens",
         "TokenTransaction": "total_tokens",
+        "AzureOpenAIRequests": "request_count",
     }
     return mapping.get(metric_name, metric_name)
 
@@ -442,12 +358,13 @@ def normalize_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "total_tokens": 0,
+                "request_count": 0,
                 "raw_dimensions": {"deployment_dimension": {}},
                 "model_resolution_source": row.get("model_resolution_source", "deployment_name_fallback"),
             }
 
         field_name = metric_name_to_field(row["metric_name"])
-        if field_name in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        if field_name in ("prompt_tokens", "completion_tokens", "total_tokens", "request_count"):
             grouped[key][field_name] += row["total"]
 
         grouped[key]["raw_dimensions"]["deployment_dimension"][row["metric_name"]] = row.get("raw_dimensions", {})
@@ -470,6 +387,7 @@ def aggregate_by_model(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
                 "total_tokens": 0,
+                "request_count": 0,
                 "resource_count": 0,
                 "regions": set(),
                 "deployments": set(),
@@ -481,6 +399,7 @@ def aggregate_by_model(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         grouped_model["prompt_tokens"] += item.get("prompt_tokens", 0)
         grouped_model["completion_tokens"] += item.get("completion_tokens", 0)
         grouped_model["total_tokens"] += item.get("total_tokens", 0)
+        grouped_model["request_count"] += item.get("request_count", 0)
         grouped_model["regions"].add(item.get("region", "unknown"))
         grouped_model["deployments"].add(item.get("model_deployment_name", "unknown"))
         grouped_model["resources"].add(item.get("resource_id", "unknown"))
@@ -504,6 +423,7 @@ def sum_items(items: list[dict[str, Any]]) -> dict[str, float]:
         "prompt_tokens": sum(x.get("prompt_tokens", 0) for x in items),
         "completion_tokens": sum(x.get("completion_tokens", 0) for x in items),
         "total_tokens": sum(x.get("total_tokens", 0) for x in items),
+        "request_count": sum(x.get("request_count", 0) for x in items),
     }
 
 
@@ -782,11 +702,13 @@ def build_model_breakdown(
             "prompt_tokens": prev.get("prompt_tokens", 0),
             "completion_tokens": prev.get("completion_tokens", 0),
             "total_tokens": prev.get("total_tokens", 0),
+            "request_count": prev.get("request_count", 0),
         }
         current_day = {
             "prompt_tokens": curr.get("prompt_tokens", 0),
             "completion_tokens": curr.get("completion_tokens", 0),
             "total_tokens": curr.get("total_tokens", 0),
+            "request_count": curr.get("request_count", 0),
         }
 
         result.append({
@@ -806,6 +728,12 @@ def build_model_breakdown(
                 ),
                 "total_tokens": calculate_change(
                     current_day["total_tokens"], previous_day["total_tokens"]
+                ),
+                "request_count": calculate_change(
+                    current_day["request_count"], previous_day["request_count"]
+                ),
+                "request_count": calculate_change(
+                    current_day["request_count"], previous_day["request_count"]
                 ),
             }
         })
@@ -846,11 +774,13 @@ def build_deployment_breakdown(
             "prompt_tokens": prev.get("prompt_tokens", 0),
             "completion_tokens": prev.get("completion_tokens", 0),
             "total_tokens": prev.get("total_tokens", 0),
+            "request_count": prev.get("request_count", 0),
         }
         current_day = {
             "prompt_tokens": curr.get("prompt_tokens", 0),
             "completion_tokens": curr.get("completion_tokens", 0),
             "total_tokens": curr.get("total_tokens", 0),
+            "request_count": curr.get("request_count", 0),
         }
 
         result.append({
@@ -965,6 +895,9 @@ def build_daily_compare_data() -> dict[str, Any]:
         "total_tokens": calculate_change(
             d4_metrics["summary"]["total_tokens"], d5_metrics["summary"]["total_tokens"]
         ),
+        "request_count": calculate_change(
+            d4_metrics["summary"]["request_count"], d5_metrics["summary"]["request_count"]
+        ),
     }
 
     return {
@@ -1061,9 +994,9 @@ def generate_report_text(compare_data: dict[str, Any]) -> str:
 4. 날짜는 KST 기준이라고 자연스럽게 반영한다.
 5. 비용은 반드시 사용자가 준 문자열(cost_total_text, difference_text)을 그대로 사용한다.
 6. 비용 문자열을 원 단위 정수로 다시 변환하거나 천 단위로 재해석하지 않는다.
-7. 토큰은 input, output, total 순서로 언급한다.
+7. 토큰은 input, output, total 순서로 언급하고, 요청 수가 있으면 함께 간단히 언급한다.
 8. 모델별 정보가 있으면 canonical model 기준 상위 모델 1~3개를 자연스럽게 언급한다.
-9. cost_data_available가 false이거나 cost_error가 있으면 비용 데이터는 일시적으로 조회되지 않았다고 안내하고 토큰 사용량 중심으로 작성한다.
+9. cost_data_available가 false이거나 cost_error가 있으면 비용 데이터는 일시적으로 조회되지 않았다고 안내하고 토큰/요청 사용량 중심으로 작성한다.
 10. 문장마다 줄바꿈하기 좋게 핵심 문장을 1문장씩 자연스럽게 끊어서 작성한다.
 11. 같은 모델이 여러 리전이나 여러 deployment에서 합산되었을 수 있음을 모델 요약에 자연스럽게 반영할 수 있다.
 """
@@ -1075,6 +1008,7 @@ def generate_report_text(compare_data: dict[str, Any]) -> str:
 - 비용은 cost_total_text 와 difference_text 값을 그대로 사용해.
 - 예: "2.1503 KRW" 를 "2,150원" 으로 바꾸면 안 돼.
 - model_summary와 top_models는 deployment가 아니라 canonical model 기준 집계다.
+- summary 안의 request_count는 Azure OpenAI Requests 메트릭 기반 요청 수다.
 
 데이터:
 {json.dumps(lightweight_data, ensure_ascii=False, indent=2)}
@@ -1173,8 +1107,8 @@ def build_deployment_breakdown_html(compare_data: dict[str, Any]) -> str:
     deployment_breakdown = compare_data["comparison"].get("deployment_breakdown", [])
     if not deployment_breakdown:
         return """
-        <h3 style="margin:24px 0 8px;">리전/배포별 Total 토큰 비교</h3>
-        <p>리전/배포별 토큰 데이터가 없습니다.</p>
+        <h3 style="margin:24px 0 8px;">리전/배포별 토큰 및 요청 비교</h3>
+        <p>리전/배포별 데이터가 없습니다.</p>
         """
 
     prev_day = compare_data["comparison"]["previous_day"]["date_kst"]
@@ -1191,12 +1125,16 @@ def build_deployment_breakdown_html(compare_data: dict[str, Any]) -> str:
           <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["current_day"]["total_tokens"])}</td>
           <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["change"]["total_tokens"]["difference"])}</td>
           <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["change"]["total_tokens"]["rate_percent"], 2)}%</td>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["previous_day"]["request_count"])}</td>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["current_day"]["request_count"])}</td>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["change"]["request_count"]["difference"])}</td>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["change"]["request_count"]["rate_percent"], 2)}%</td>
         </tr>
         """
 
     return f"""
-    <h3 style="margin:24px 0 8px;">리전/배포별 Total 토큰 비교</h3>
-    <table style="border-collapse:collapse; width:100%; max-width:1200px; font-size:13px;">
+    <h3 style="margin:24px 0 8px;">리전/배포별 토큰 및 요청 비교</h3>
+    <table style="border-collapse:collapse; width:100%; max-width:1400px; font-size:13px;">
       <tr style="background:#f3f4f6;">
         <th style="border:1px solid #d1d5db; padding:8px;">리전</th>
         <th style="border:1px solid #d1d5db; padding:8px;">모델명</th>
@@ -1205,6 +1143,10 @@ def build_deployment_breakdown_html(compare_data: dict[str, Any]) -> str:
         <th style="border:1px solid #d1d5db; padding:8px;">{curr_day} Total</th>
         <th style="border:1px solid #d1d5db; padding:8px;">Total 증감</th>
         <th style="border:1px solid #d1d5db; padding:8px;">Total 증감률</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">{prev_day} Requests</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">{curr_day} Requests</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">Requests 증감</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">Requests 증감률</th>
       </tr>
       {rows_html}
     </table>
@@ -1215,6 +1157,7 @@ def build_email_html(report_text: str, compare_data: dict[str, Any]) -> str:
     prev_day = compare_data["comparison"]["previous_day"]
     curr_day = compare_data["comparison"]["current_day"]
     token_change = compare_data["comparison"]["summary_change"]["tokens"]
+    request_change = token_change["request_count"]
     cost_change = compare_data["comparison"]["summary_change"]["cost"]
 
     currency = curr_day["costs"].get("currency") or prev_day["costs"].get("currency") or "KRW"
@@ -1289,6 +1232,24 @@ def build_email_html(report_text: str, compare_data: dict[str, Any]) -> str:
               <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(curr_day["metrics"]["summary"]["total_tokens"])}</td>
               <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(token_change["total_tokens"]["difference"])}</td>
               <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(token_change["total_tokens"]["rate_percent"], 2)}%</td>
+            </tr>
+          </table>
+
+          <h3 style="margin:24px 0 8px;">요청 수 요약</h3>
+          <table style="border-collapse:collapse; width:100%; max-width:700px; font-size:13px;">
+            <tr style="background:#f3f4f6;">
+              <th style="border:1px solid #d1d5db; padding:8px;">항목</th>
+              <th style="border:1px solid #d1d5db; padding:8px;">{prev_day["date_kst"]}</th>
+              <th style="border:1px solid #d1d5db; padding:8px;">{curr_day["date_kst"]}</th>
+              <th style="border:1px solid #d1d5db; padding:8px;">증감</th>
+              <th style="border:1px solid #d1d5db; padding:8px;">증감률</th>
+            </tr>
+            <tr>
+              <td style="border:1px solid #d1d5db; padding:8px;">Requests</td>
+              <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(prev_day["metrics"]["summary"]["request_count"])}</td>
+              <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(curr_day["metrics"]["summary"]["request_count"])}</td>
+              <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(request_change["difference"])}</td>
+              <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(request_change["rate_percent"], 2)}%</td>
             </tr>
           </table>
 
@@ -1457,64 +1418,43 @@ def model_rollup_debug(req: func.HttpRequest) -> func.HttpResponse:
 def request_metric_debug(req: func.HttpRequest) -> func.HttpResponse:
     try:
         days_ago = int(req.params.get("days_ago", "4"))
-        resource_index = req.params.get("resource_index")
-        metric_param = (req.params.get("metrics") or "Requests,CallCount").strip()
-        dimension_param = (req.params.get("dimensions") or "ModelDeploymentName,ModelName,ApiName,ModelVersion,Region,none").strip()
-
-        metric_candidates = [x.strip() for x in metric_param.split(",") if x.strip()]
-        dimensions_raw = [x.strip() for x in dimension_param.split(",") if x.strip()]
-        dimensions: list[str | None] = []
-        for x in dimensions_raw:
-            if x.lower() in ("none", "null", "aggregate"):
-                dimensions.append(None)
-            else:
-                dimensions.append(x)
-
         resources = load_resources()
-        if resource_index is not None:
-            selected_idx = int(resource_index)
-            resources = [resources[selected_idx]]
-
+        deployment_model_map = load_deployment_model_map()
         credential = DefaultAzureCredential()
-        start_time_utc, end_time_utc, target_date_kst = get_kst_day_range_to_utc(days_ago)
 
-        debug_resources: list[dict[str, Any]] = []
+        metric_name = req.params.get("metric", "AzureOpenAIRequests")
+        start_utc, end_utc, target_date_kst = get_kst_day_range_to_utc(days_ago)
+
+        debug_resources = []
         for resource in resources:
-            metric_results: dict[str, Any] = {}
-            for metric_name in metric_candidates:
-                per_dimension: dict[str, Any] = {}
-                for dimension_name in dimensions:
-                    key = "aggregate" if dimension_name is None else dimension_name
-                    per_dimension[key] = query_metric_debug(
-                        credential=credential,
-                        resource_id=resource["resource_id"],
-                        metric_name=metric_name,
-                        start_time_utc=start_time_utc,
-                        end_time_utc=end_time_utc,
-                        dimension_name=dimension_name,
-                    )
-                metric_results[metric_name] = per_dimension
-
+            rows = query_metric_split_by_deployment(
+                credential=credential,
+                resource_id=resource["resource_id"],
+                metric_name=metric_name,
+                start_time_utc=start_utc,
+                end_time_utc=end_utc,
+                deployment_model_map=deployment_model_map,
+            )
             debug_resources.append({
                 "resource_id": resource["resource_id"],
                 "region": resource["region"],
-                "metric_results": metric_results,
+                "items": rows,
             })
 
-        result = {
-            "days_ago": days_ago,
-            "target_date_kst": target_date_kst,
-            "start_time_utc": start_time_utc,
-            "end_time_utc": end_time_utc,
-            "metric_candidates": metric_candidates,
-            "dimension_candidates": ["aggregate" if x is None else x for x in dimensions],
-            "debug_resources": debug_resources,
-        }
-
         return func.HttpResponse(
-            json.dumps(result, ensure_ascii=False, indent=2, default=str),
+            json.dumps(
+                {
+                    "days_ago": days_ago,
+                    "target_date_kst": target_date_kst,
+                    "metric_name": metric_name,
+                    "debug_resources": debug_resources,
+                },
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            ),
             mimetype="application/json",
-            status_code=200
+            status_code=200,
         )
     except Exception as e:
         logging.exception("request_metric_debug failed")
