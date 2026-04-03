@@ -732,9 +732,6 @@ def build_model_breakdown(
                 "request_count": calculate_change(
                     current_day["request_count"], previous_day["request_count"]
                 ),
-                "request_count": calculate_change(
-                    current_day["request_count"], previous_day["request_count"]
-                ),
             }
         })
 
@@ -800,6 +797,9 @@ def build_deployment_breakdown(
                 ),
                 "total_tokens": calculate_change(
                     current_day["total_tokens"], previous_day["total_tokens"]
+                ),
+                "request_count": calculate_change(
+                    current_day["request_count"], previous_day["request_count"]
                 ),
             }
         })
@@ -1034,7 +1034,7 @@ def build_model_breakdown_html(compare_data: dict[str, Any]) -> str:
     model_breakdown = compare_data["comparison"].get("model_breakdown", [])
     if not model_breakdown:
         return """
-        <h3 style="margin:24px 0 8px;">모델별 토큰 비교 (모델 기준 통합)</h3>
+        <h3 style="margin:24px 0 8px;">모델별 토큰 및 요청 비교 (모델 기준 통합)</h3>
         <p>모델별 토큰 데이터가 없습니다.</p>
         """
 
@@ -1092,11 +1092,23 @@ def build_model_breakdown_html(compare_data: dict[str, Any]) -> str:
           <th style="border:1px solid #d1d5db; padding:8px; background:#f9fafb;">Total 증감률</th>
           <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["change"]["total_tokens"]["rate_percent"], 2)}%</td>
         </tr>
+        <tr>
+          <th style="border:1px solid #d1d5db; padding:8px; background:#f9fafb;">{prev_day} Requests</th>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["previous_day"]["request_count"])}</td>
+          <th style="border:1px solid #d1d5db; padding:8px; background:#f9fafb;">{curr_day} Requests</th>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["current_day"]["request_count"])}</td>
+        </tr>
+        <tr>
+          <th style="border:1px solid #d1d5db; padding:8px; background:#f9fafb;">Requests 증감</th>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["change"]["request_count"]["difference"])}</td>
+          <th style="border:1px solid #d1d5db; padding:8px; background:#f9fafb;">Requests 증감률</th>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["change"]["request_count"]["rate_percent"], 2)}%</td>
+        </tr>
         <tr><td colspan="4" style="border:none; height:12px;"></td></tr>
         """
 
     return f"""
-    <h3 style="margin:24px 0 8px;">모델별 토큰 비교 (모델 기준 통합)</h3>
+    <h3 style="margin:24px 0 8px;">모델별 토큰 및 요청 비교 (모델 기준 통합)</h3>
     <table style="border-collapse:collapse; width:100%; max-width:900px; font-size:13px;">
       {rows_html}
     </table>
