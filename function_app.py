@@ -55,12 +55,6 @@ def calculate_change(current_value: float | None, previous_value: float | None) 
     return {"difference": diff, "rate_percent": rate}
 
 
-def calculate_avg_tokens_per_request(total_tokens: float | int | None, request_count: float | int | None) -> float | None:
-    if total_tokens is None or request_count in (None, 0):
-        return None
-    return float(total_tokens) / float(request_count)
-
-
 def normalize_dimension_value(value: str | None, fallback: str = "unknown") -> str:
     if value is None:
         return fallback
@@ -424,20 +418,12 @@ def aggregate_by_model(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return results
 
 
-def sum_items(items: list[dict[str, Any]]) -> dict[str, float | None]:
-    prompt_tokens = sum(x.get("prompt_tokens", 0) for x in items)
-    completion_tokens = sum(x.get("completion_tokens", 0) for x in items)
-    total_tokens = sum(x.get("total_tokens", 0) for x in items)
-    request_count = sum(x.get("request_count", 0) for x in items)
-
+def sum_items(items: list[dict[str, Any]]) -> dict[str, float]:
     return {
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": total_tokens,
-        "request_count": request_count,
-        "avg_prompt_tokens_per_request": calculate_avg_tokens_per_request(prompt_tokens, request_count),
-        "avg_completion_tokens_per_request": calculate_avg_tokens_per_request(completion_tokens, request_count),
-        "avg_total_tokens_per_request": calculate_avg_tokens_per_request(total_tokens, request_count),
+        "prompt_tokens": sum(x.get("prompt_tokens", 0) for x in items),
+        "completion_tokens": sum(x.get("completion_tokens", 0) for x in items),
+        "total_tokens": sum(x.get("total_tokens", 0) for x in items),
+        "request_count": sum(x.get("request_count", 0) for x in items),
     }
 
 
@@ -717,18 +703,12 @@ def build_model_breakdown(
             "completion_tokens": prev.get("completion_tokens", 0),
             "total_tokens": prev.get("total_tokens", 0),
             "request_count": prev.get("request_count", 0),
-            "avg_prompt_tokens_per_request": prev.get("avg_prompt_tokens_per_request"),
-            "avg_completion_tokens_per_request": prev.get("avg_completion_tokens_per_request"),
-            "avg_total_tokens_per_request": prev.get("avg_total_tokens_per_request"),
         }
         current_day = {
             "prompt_tokens": curr.get("prompt_tokens", 0),
             "completion_tokens": curr.get("completion_tokens", 0),
             "total_tokens": curr.get("total_tokens", 0),
             "request_count": curr.get("request_count", 0),
-            "avg_prompt_tokens_per_request": curr.get("avg_prompt_tokens_per_request"),
-            "avg_completion_tokens_per_request": curr.get("avg_completion_tokens_per_request"),
-            "avg_total_tokens_per_request": curr.get("avg_total_tokens_per_request"),
         }
 
         result.append({
@@ -751,15 +731,6 @@ def build_model_breakdown(
                 ),
                 "request_count": calculate_change(
                     current_day["request_count"], previous_day["request_count"]
-                ),
-                "avg_prompt_tokens_per_request": calculate_change(
-                    current_day["avg_prompt_tokens_per_request"], previous_day["avg_prompt_tokens_per_request"]
-                ),
-                "avg_completion_tokens_per_request": calculate_change(
-                    current_day["avg_completion_tokens_per_request"], previous_day["avg_completion_tokens_per_request"]
-                ),
-                "avg_total_tokens_per_request": calculate_change(
-                    current_day["avg_total_tokens_per_request"], previous_day["avg_total_tokens_per_request"]
                 ),
             }
         })
@@ -1024,11 +995,10 @@ def generate_report_text(compare_data: dict[str, Any]) -> str:
 5. 비용은 반드시 사용자가 준 문자열(cost_total_text, difference_text)을 그대로 사용한다.
 6. 비용 문자열을 원 단위 정수로 다시 변환하거나 천 단위로 재해석하지 않는다.
 7. 토큰은 input, output, total 순서로 언급하고, 요청 수가 있으면 함께 간단히 언급한다.
-8. 평균 토큰/요청(avg_total_tokens_per_request)이 있으면 전체 또는 주요 모델 기준으로 자연스럽게 짧게 반영한다.
-9. 모델별 정보가 있으면 canonical model 기준 상위 모델 1~3개를 자연스럽게 언급한다.
-10. cost_data_available가 false이거나 cost_error가 있으면 비용 데이터는 일시적으로 조회되지 않았다고 안내하고 토큰/요청 사용량 중심으로 작성한다.
-11. 문장마다 줄바꿈하기 좋게 핵심 문장을 1문장씩 자연스럽게 끊어서 작성한다.
-12. 같은 모델이 여러 리전이나 여러 deployment에서 합산되었을 수 있음을 모델 요약에 자연스럽게 반영할 수 있다.
+8. 모델별 정보가 있으면 canonical model 기준 상위 모델 1~3개를 자연스럽게 언급한다.
+9. cost_data_available가 false이거나 cost_error가 있으면 비용 데이터는 일시적으로 조회되지 않았다고 안내하고 토큰/요청 사용량 중심으로 작성한다.
+10. 문장마다 줄바꿈하기 좋게 핵심 문장을 1문장씩 자연스럽게 끊어서 작성한다.
+11. 같은 모델이 여러 리전이나 여러 deployment에서 합산되었을 수 있음을 모델 요약에 자연스럽게 반영할 수 있다.
 """
 
     user_prompt = f"""
@@ -1039,7 +1009,6 @@ def generate_report_text(compare_data: dict[str, Any]) -> str:
 - 예: "2.1503 KRW" 를 "2,150원" 으로 바꾸면 안 돼.
 - model_summary와 top_models는 deployment가 아니라 canonical model 기준 집계다.
 - summary 안의 request_count는 Azure OpenAI Requests 메트릭 기반 요청 수다.
-- summary 와 model_summary의 avg_*_tokens_per_request 는 요청 1건당 평균 토큰 수다.
 
 데이터:
 {json.dumps(lightweight_data, ensure_ascii=False, indent=2)}
@@ -1122,42 +1091,6 @@ def build_model_breakdown_html(compare_data: dict[str, Any]) -> str:
           <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["change"]["total_tokens"]["difference"])}</td>
           <th style="border:1px solid #d1d5db; padding:8px; background:#f9fafb;">Total 증감률</th>
           <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["change"]["total_tokens"]["rate_percent"], 2)}%</td>
-        </tr>
-        <tr>
-          <th style="border:1px solid #d1d5db; padding:8px; background:#eef6ff;">{prev_day} Avg Input / Request</th>
-          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["previous_day"]["avg_prompt_tokens_per_request"], 2)}</td>
-          <th style="border:1px solid #d1d5db; padding:8px; background:#eef6ff;">{curr_day} Avg Input / Request</th>
-          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["current_day"]["avg_prompt_tokens_per_request"], 2)}</td>
-        </tr>
-        <tr>
-          <th style="border:1px solid #d1d5db; padding:8px; background:#eef6ff;">Avg Input / Request 증감</th>
-          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["change"]["avg_prompt_tokens_per_request"]["difference"], 2)}</td>
-          <th style="border:1px solid #d1d5db; padding:8px; background:#eef6ff;">Avg Input / Request 증감률</th>
-          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["change"]["avg_prompt_tokens_per_request"]["rate_percent"], 2)}%</td>
-        </tr>
-        <tr>
-          <th style="border:1px solid #d1d5db; padding:8px; background:#eef6ff;">{prev_day} Avg Output / Request</th>
-          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["previous_day"]["avg_completion_tokens_per_request"], 2)}</td>
-          <th style="border:1px solid #d1d5db; padding:8px; background:#eef6ff;">{curr_day} Avg Output / Request</th>
-          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["current_day"]["avg_completion_tokens_per_request"], 2)}</td>
-        </tr>
-        <tr>
-          <th style="border:1px solid #d1d5db; padding:8px; background:#eef6ff;">Avg Output / Request 증감</th>
-          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["change"]["avg_completion_tokens_per_request"]["difference"], 2)}</td>
-          <th style="border:1px solid #d1d5db; padding:8px; background:#eef6ff;">Avg Output / Request 증감률</th>
-          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["change"]["avg_completion_tokens_per_request"]["rate_percent"], 2)}%</td>
-        </tr>
-        <tr>
-          <th style="border:1px solid #d1d5db; padding:8px; background:#eef6ff;">{prev_day} Avg Total / Request</th>
-          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["previous_day"]["avg_total_tokens_per_request"], 2)}</td>
-          <th style="border:1px solid #d1d5db; padding:8px; background:#eef6ff;">{curr_day} Avg Total / Request</th>
-          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["current_day"]["avg_total_tokens_per_request"], 2)}</td>
-        </tr>
-        <tr>
-          <th style="border:1px solid #d1d5db; padding:8px; background:#eef6ff;">Avg Total / Request 증감</th>
-          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["change"]["avg_total_tokens_per_request"]["difference"], 2)}</td>
-          <th style="border:1px solid #d1d5db; padding:8px; background:#eef6ff;">Avg Total / Request 증감률</th>
-          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["change"]["avg_total_tokens_per_request"]["rate_percent"], 2)}%</td>
         </tr>
         <tr>
           <th style="border:1px solid #d1d5db; padding:8px; background:#f9fafb;">{prev_day} Requests</th>
@@ -1329,13 +1262,6 @@ def build_email_html(report_text: str, compare_data: dict[str, Any]) -> str:
               <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(curr_day["metrics"]["summary"]["request_count"])}</td>
               <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(request_change["difference"])}</td>
               <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(request_change["rate_percent"], 2)}%</td>
-            </tr>
-            <tr>
-              <td style="border:1px solid #d1d5db; padding:8px;">Avg Total Tokens / Request</td>
-              <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(prev_day["metrics"]["summary"].get("avg_total_tokens_per_request"), 2)}</td>
-              <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(curr_day["metrics"]["summary"].get("avg_total_tokens_per_request"), 2)}</td>
-              <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(calculate_change(curr_day["metrics"]["summary"].get("avg_total_tokens_per_request"), prev_day["metrics"]["summary"].get("avg_total_tokens_per_request"))["difference"], 2)}</td>
-              <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(calculate_change(curr_day["metrics"]["summary"].get("avg_total_tokens_per_request"), prev_day["metrics"]["summary"].get("avg_total_tokens_per_request"))["rate_percent"], 2)}%</td>
             </tr>
           </table>
 
