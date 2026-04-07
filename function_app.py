@@ -1522,3 +1522,562 @@ def daily_report_timer(mytimer: func.TimerRequest) -> None:
     except Exception:
         logging.exception("daily_report_timer failed")
         raise
+
+
+# -----------------------------
+# 월간 리포트용 기간 유틸
+# -----------------------------
+def get_previous_month_range_to_utc() -> tuple[datetime, datetime, str, str, str]:
+    now_kst = datetime.now(KST)
+    this_month_start_kst = datetime(now_kst.year, now_kst.month, 1, 0, 0, 0, tzinfo=KST)
+    prev_month_end_kst = this_month_start_kst - timedelta(seconds=1)
+    prev_month_start_kst = datetime(prev_month_end_kst.year, prev_month_end_kst.month, 1, 0, 0, 0, tzinfo=KST)
+
+    period_label = f"{prev_month_start_kst.strftime('%Y-%m')} 월간"
+    return (
+        prev_month_start_kst.astimezone(timezone.utc),
+        this_month_start_kst.astimezone(timezone.utc),
+        prev_month_start_kst.strftime("%Y-%m-%d"),
+        prev_month_end_kst.strftime("%Y-%m-%d"),
+        period_label,
+    )
+
+
+def fetch_metrics_for_custom_range(
+    credential: DefaultAzureCredential,
+    resources: list[dict[str, str]],
+    start_time_utc: datetime,
+    end_time_utc: datetime,
+    deployment_model_map: dict[str, str],
+) -> dict[str, Any]:
+    all_rows: list[dict[str, Any]] = []
+
+    for resource in resources:
+        rows = query_all_metrics_for_resource(
+            credential=credential,
+            resource=resource,
+            start_time_utc=start_time_utc,
+            end_time_utc=end_time_utc,
+            deployment_model_map=deployment_model_map,
+        )
+        all_rows.extend(rows)
+
+    normalized = normalize_rows(all_rows)
+    model_summary = aggregate_by_model(normalized)
+    summary = sum_items(normalized)
+
+    return {
+        "start_time_utc": start_time_utc.isoformat(),
+        "end_time_utc": end_time_utc.isoformat(),
+        "items": normalized,
+        "model_summary": model_summary,
+        "summary": summary,
+    }
+
+
+def fetch_costs_for_custom_range(
+    credential: DefaultAzureCredential,
+    subscription_id: str,
+    resource_ids: list[str],
+    start_time_utc: datetime,
+    end_time_utc: datetime,
+    period_label: str,
+    start_kst_str: str,
+    end_kst_str: str,
+) -> dict[str, Any]:
+    token = credential.get_token("https://management.azure.com/.default").token
+
+    url = (
+        f"https://management.azure.com/subscriptions/{subscription_id}"
+        f"/providers/Microsoft.CostManagement/query?api-version=2025-03-01"
+    )
+
+    body = {
+        "type": "Usage",
+        "timeframe": "Custom",
+        "timePeriod": {
+            "from": start_time_utc.isoformat(),
+            "to": end_time_utc.isoformat()
+        },
+        "dataset": {
+            "granularity": "Daily",
+            "aggregation": {
+                "totalCost": {
+                    "name": "PreTaxCost",
+                    "function": "Sum"
+                }
+            },
+            "grouping": [
+                {"type": "Dimension", "name": "ResourceId"}
+            ]
+        }
+    }
+
+    retry_delays = [60, 300, 600]
+    last_response = None
+
+    for attempt in range(len(retry_delays) + 1):
+        response = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            },
+            json=body,
+            timeout=60
+        )
+
+        if response.status_code == 200:
+            data = response.json()
+            properties = data.get("properties", {})
+            rows = properties.get("rows", [])
+            columns = properties.get("columns", [])
+
+            resource_id_idx = find_column_index(columns, "ResourceId")
+            total_cost_idx = find_column_index(columns, "totalCost", "PreTaxCost")
+            currency_idx = find_column_index(columns, "Currency")
+            usage_date_idx = find_column_index(columns, "UsageDate")
+
+            normalized_resource_ids = {x.lower(): x for x in resource_ids}
+            daily_rows = []
+            total_cost = 0.0
+            currency = None
+
+            for row in rows:
+                row_resource_id = str(row[resource_id_idx]).lower() if resource_id_idx is not None else ""
+                if resource_ids and row_resource_id not in normalized_resource_ids:
+                    continue
+
+                cost_value = float(row[total_cost_idx]) if total_cost_idx is not None else 0.0
+                currency = row[currency_idx] if currency_idx is not None else currency
+                usage_date = str(row[usage_date_idx]) if usage_date_idx is not None else ""
+
+                daily_rows.append({
+                    "usage_date": usage_date,
+                    "resource_id": normalized_resource_ids.get(row_resource_id, row_resource_id),
+                    "cost": cost_value,
+                    "currency": currency
+                })
+                total_cost += cost_value
+
+            daily_rows.sort(key=lambda x: (x["usage_date"], x["resource_id"]))
+            resource_totals: dict[str, float] = {}
+            for row in daily_rows:
+                rid = row["resource_id"]
+                resource_totals[rid] = resource_totals.get(rid, 0.0) + row["cost"]
+
+            resource_costs = [
+                {"resource_id": rid, "cost": cost, "currency": currency}
+                for rid, cost in sorted(resource_totals.items(), key=lambda x: (-x[1], x[0]))
+            ]
+
+            return {
+                "period_label": period_label,
+                "period_kst": f"{start_kst_str} ~ {end_kst_str}",
+                "start_time_utc": start_time_utc.isoformat(),
+                "end_time_utc": end_time_utc.isoformat(),
+                "currency": currency,
+                "total_cost": total_cost,
+                "daily_rows": daily_rows,
+                "resource_costs": resource_costs,
+                "cost_data_available": True,
+            }
+
+        last_response = response
+        if response.status_code == 429 and attempt < len(retry_delays):
+            delay = retry_delays[attempt]
+            logging.warning(
+                "Monthly Cost API throttled (429). retry=%s/%s wait=%ss",
+                attempt + 1,
+                len(retry_delays),
+                delay
+            )
+            time.sleep(delay)
+            continue
+        break
+
+    raise RuntimeError(
+        f"월간 Cost API 호출 실패: {last_response.status_code} / {last_response.text}"
+    )
+
+
+def build_monthly_report_data() -> dict[str, Any]:
+    resources = load_resources()
+    deployment_model_map = load_deployment_model_map()
+    credential = DefaultAzureCredential()
+    subscription_id = get_env("SUBSCRIPTION_ID")
+    resource_ids = [x["resource_id"] for x in resources]
+
+    start_utc, end_utc, start_kst_str, end_kst_str, period_label = get_previous_month_range_to_utc()
+
+    metrics = fetch_metrics_for_custom_range(
+        credential=credential,
+        resources=resources,
+        start_time_utc=start_utc,
+        end_time_utc=end_utc,
+        deployment_model_map=deployment_model_map,
+    )
+
+    cost_error = None
+    try:
+        costs = fetch_costs_for_custom_range(
+            credential=credential,
+            subscription_id=subscription_id,
+            resource_ids=resource_ids,
+            start_time_utc=start_utc,
+            end_time_utc=end_utc,
+            period_label=period_label,
+            start_kst_str=start_kst_str,
+            end_kst_str=end_kst_str,
+        )
+    except Exception as e:
+        logging.exception("Monthly cost data fetch failed")
+        cost_error = str(e)
+        costs = {
+            "period_label": period_label,
+            "period_kst": f"{start_kst_str} ~ {end_kst_str}",
+            "start_time_utc": start_utc.isoformat(),
+            "end_time_utc": end_utc.isoformat(),
+            "currency": None,
+            "total_cost": None,
+            "daily_rows": [],
+            "resource_costs": [],
+            "cost_data_available": False,
+        }
+
+    return {
+        "period_label": period_label,
+        "period_kst": f"{start_kst_str} ~ {end_kst_str}",
+        "month": start_kst_str[:7],
+        "metrics": metrics,
+        "costs": costs,
+        "cost_error": cost_error,
+    }
+
+
+def generate_monthly_report_text(monthly_data: dict[str, Any]) -> str:
+    client = get_azure_openai_client()
+    deployment_name = get_env("AZURE_OPENAI_DEPLOYMENT_NAME")
+
+    metrics = monthly_data["metrics"]
+    costs = monthly_data["costs"]
+    summary = metrics["summary"]
+    currency = costs.get("currency")
+    top_models = metrics.get("model_summary", [])[:3]
+
+    lightweight_data = {
+        "period_label": monthly_data["period_label"],
+        "period_kst": monthly_data["period_kst"],
+        "cost_error": monthly_data.get("cost_error"),
+        "summary": summary,
+        "cost_total_text": format_cost_text(costs.get("total_cost"), currency),
+        "cost_available": costs.get("cost_data_available", True),
+        "top_models": top_models,
+    }
+
+    system_prompt = """
+너는 Azure OpenAI 비용 분석 리포트를 작성하는 FinOps 분석가다.
+사용자가 제공한 JSON 데이터를 바탕으로 짧고 명확한 한국어 월간 리포트를 작성한다.
+
+규칙:
+1. 과장하지 말고 데이터에 근거해서만 작성한다.
+2. 6문장 이내로 작성한다.
+3. 기간은 반드시 전월 1일~말일 기준이라고 자연스럽게 반영한다.
+4. 비용은 반드시 사용자가 준 문자열(cost_total_text)을 그대로 사용한다.
+5. 비용 문자열을 원 단위 정수로 다시 변환하거나 천 단위로 재해석하지 않는다.
+6. 토큰은 input, output, total 순서로 언급하고, 요청 수가 있으면 함께 간단히 언급한다.
+7. 모델별 정보가 있으면 canonical model 기준 상위 모델 1~3개를 자연스럽게 언급한다.
+8. cost_data_available가 false이거나 cost_error가 있으면 비용 데이터는 일시적으로 조회되지 않았다고 안내하고 토큰/요청 사용량 중심으로 작성한다.
+9. 같은 모델이 여러 리전이나 여러 deployment에서 합산되었을 수 있음을 자연스럽게 반영할 수 있다.
+"""
+
+    user_prompt = f"""
+다음 JSON 데이터를 기반으로 Azure OpenAI 월간 리포트를 한국어로 작성해줘.
+
+중요:
+- 비용은 cost_total_text 값을 그대로 사용해.
+- model_summary와 top_models는 deployment가 아니라 canonical model 기준 집계다.
+- summary 안의 request_count는 Azure OpenAI Requests 메트릭 기반 요청 수다.
+- 기간은 전월 1일~말일 기준이다.
+
+데이터:
+{json.dumps(lightweight_data, ensure_ascii=False, indent=2)}
+"""
+
+    response = client.chat.completions.create(
+        model=deployment_name,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ],
+        temperature=0.1,
+        max_tokens=500
+    )
+
+    return add_line_breaks(response.choices[0].message.content.strip())
+
+
+def build_monthly_model_summary_html(monthly_data: dict[str, Any]) -> str:
+    model_summary = monthly_data["metrics"].get("model_summary", [])
+    if not model_summary:
+        return """
+        <h3 style="margin:24px 0 8px;">모델별 월간 토큰 및 요청 집계</h3>
+        <p>모델별 데이터가 없습니다.</p>
+        """
+
+    rows_html = ""
+    for item in model_summary:
+        rows_html += f"""
+        <tr>
+          <td style="border:1px solid #d1d5db; padding:8px;">{item["model_name"]}</td>
+          <td style="border:1px solid #d1d5db; padding:8px;">{", ".join(item.get("regions", [])) or "-"}</td>
+          <td style="border:1px solid #d1d5db; padding:8px;">{", ".join(item.get("deployments", [])) or "-"}</td>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item.get("prompt_tokens"))}</td>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item.get("completion_tokens"))}</td>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item.get("total_tokens"))}</td>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item.get("request_count"))}</td>
+        </tr>
+        """
+
+    return f"""
+    <h3 style="margin:24px 0 8px;">모델별 월간 토큰 및 요청 집계 (모델 기준 통합)</h3>
+    <table style="border-collapse:collapse; width:100%; max-width:1400px; font-size:13px;">
+      <tr style="background:#f3f4f6;">
+        <th style="border:1px solid #d1d5db; padding:8px;">모델명</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">리전</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">포함된 배포명</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">Input Tokens</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">Output Tokens</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">Total Tokens</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">Requests</th>
+      </tr>
+      {rows_html}
+    </table>
+    """
+
+
+def build_monthly_deployment_html(monthly_data: dict[str, Any]) -> str:
+    items = monthly_data["metrics"].get("items", [])
+    if not items:
+        return """
+        <h3 style="margin:24px 0 8px;">리전/배포별 월간 토큰 및 요청 집계</h3>
+        <p>리전/배포별 데이터가 없습니다.</p>
+        """
+
+    rows_html = ""
+    for item in items:
+        rows_html += f"""
+        <tr>
+          <td style="border:1px solid #d1d5db; padding:8px;">{item["region"]}</td>
+          <td style="border:1px solid #d1d5db; padding:8px;">{item["model_name"]}</td>
+          <td style="border:1px solid #d1d5db; padding:8px;">{item["model_deployment_name"]}</td>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["prompt_tokens"])}</td>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["completion_tokens"])}</td>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["total_tokens"])}</td>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(item["request_count"])}</td>
+        </tr>
+        """
+
+    return f"""
+    <h3 style="margin:24px 0 8px;">리전/배포별 월간 토큰 및 요청 집계</h3>
+    <table style="border-collapse:collapse; width:100%; max-width:1400px; font-size:13px;">
+      <tr style="background:#f3f4f6;">
+        <th style="border:1px solid #d1d5db; padding:8px;">리전</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">모델명</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">배포명</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">Input Tokens</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">Output Tokens</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">Total Tokens</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">Requests</th>
+      </tr>
+      {rows_html}
+    </table>
+    """
+
+
+def build_monthly_cost_html(monthly_data: dict[str, Any]) -> str:
+    costs = monthly_data["costs"]
+    currency = costs.get("currency")
+
+    if not costs.get("cost_data_available", True):
+        return f"""
+        <h3 style="margin:24px 0 8px;">월간 비용</h3>
+        <p>비용 데이터는 일시적으로 조회되지 않았습니다.</p>
+        """
+
+    resource_rows_html = ""
+    for row in costs.get("resource_costs", []):
+        resource_rows_html += f"""
+        <tr>
+          <td style="border:1px solid #d1d5db; padding:8px;">{row["resource_id"]}</td>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_cost_text(row["cost"], currency)}</td>
+        </tr>
+        """
+
+    return f"""
+    <h3 style="margin:24px 0 8px;">월간 비용</h3>
+    <p><strong>기간:</strong> {monthly_data["period_kst"]}</p>
+    <p><strong>총 비용:</strong> {format_cost_text(costs.get("total_cost"), currency)}</p>
+    <table style="border-collapse:collapse; width:100%; max-width:1000px; font-size:13px;">
+      <tr style="background:#f3f4f6;">
+        <th style="border:1px solid #d1d5db; padding:8px;">리소스 ID</th>
+        <th style="border:1px solid #d1d5db; padding:8px;">비용</th>
+      </tr>
+      {resource_rows_html}
+    </table>
+    """
+
+
+def build_monthly_email_html(report_text: str, monthly_data: dict[str, Any]) -> str:
+    metrics = monthly_data["metrics"]
+    costs = monthly_data["costs"]
+    summary = metrics["summary"]
+    currency = costs.get("currency")
+
+    model_section = build_monthly_model_summary_html(monthly_data)
+    deployment_section = build_monthly_deployment_html(monthly_data)
+    cost_section = build_monthly_cost_html(monthly_data)
+
+    html = f"""
+    <html>
+      <body style="font-family:Arial, sans-serif; color:#111827; background:#f9fafb; margin:0; padding:24px;">
+        <div style="max-width:1200px; margin:0 auto; background:white; border:1px solid #e5e7eb; border-radius:12px; padding:24px;">
+          <h2 style="margin-top:0;">Azure OpenAI 월간 리포트</h2>
+          <p style="color:#6b7280; margin-top:-8px;">대상 기간: {monthly_data["period_kst"]}</p>
+
+          <div style="background:#f3f4f6; border-radius:8px; padding:16px; white-space:pre-wrap; line-height:1.6;">{report_text}</div>
+
+          <h3 style="margin:24px 0 8px;">월간 요약</h3>
+          <table style="border-collapse:collapse; width:100%; max-width:900px; font-size:13px;">
+            <tr style="background:#f3f4f6;">
+              <th style="border:1px solid #d1d5db; padding:8px;">항목</th>
+              <th style="border:1px solid #d1d5db; padding:8px;">값</th>
+            </tr>
+            <tr>
+              <td style="border:1px solid #d1d5db; padding:8px;">Input Tokens</td>
+              <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(summary.get("prompt_tokens"))}</td>
+            </tr>
+            <tr>
+              <td style="border:1px solid #d1d5db; padding:8px;">Output Tokens</td>
+              <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(summary.get("completion_tokens"))}</td>
+            </tr>
+            <tr>
+              <td style="border:1px solid #d1d5db; padding:8px;">Total Tokens</td>
+              <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(summary.get("total_tokens"))}</td>
+            </tr>
+            <tr>
+              <td style="border:1px solid #d1d5db; padding:8px;">Requests</td>
+              <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_number(summary.get("request_count"))}</td>
+            </tr>
+            <tr>
+              <td style="border:1px solid #d1d5db; padding:8px;">Total Cost</td>
+              <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_cost_text(costs.get("total_cost"), currency)}</td>
+            </tr>
+          </table>
+
+          {model_section}
+          {deployment_section}
+          {cost_section}
+
+          <p style="margin-top:28px; color:#666; font-size:12px;">
+            This report was generated by AOAI FinOps Sentinel.
+          </p>
+        </div>
+      </body>
+    </html>
+    """
+    return html
+
+
+def execute_monthly_report_send() -> dict[str, Any]:
+    monthly_data = build_monthly_report_data()
+    report_text = generate_monthly_report_text(monthly_data)
+    html_body = build_monthly_email_html(report_text, monthly_data)
+
+    subject = f"[AOAI FinOps Sentinel] Azure OpenAI 월간 리포트 - {monthly_data['month']}"
+    send_result = send_email(subject, html_body)
+
+    return {
+        "message": "월간 메일 발송 완료",
+        "send_result": send_result,
+        "report_text": report_text,
+        "monthly_data": monthly_data
+    }
+
+
+@app.route(route="monthly_report_data", methods=["GET"])
+def monthly_report_data(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        result = build_monthly_report_data()
+        return func.HttpResponse(
+            json.dumps(result, ensure_ascii=False, indent=2, default=str),
+            mimetype="application/json",
+            status_code=200
+        )
+    except Exception as e:
+        logging.exception("monthly_report_data failed")
+        return func.HttpResponse(str(e), status_code=500, mimetype="text/plain")
+
+
+@app.route(route="monthly_report_preview", methods=["GET"])
+def monthly_report_preview(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        monthly_data = build_monthly_report_data()
+        report_text = generate_monthly_report_text(monthly_data)
+        html_body = build_monthly_email_html(report_text, monthly_data)
+
+        result = {
+            "report_text": report_text,
+            "source_data": monthly_data,
+            "html_preview": html_body
+        }
+
+        return func.HttpResponse(
+            json.dumps(result, ensure_ascii=False, indent=2, default=str),
+            mimetype="application/json",
+            status_code=200
+        )
+    except Exception as e:
+        logging.exception("monthly_report_preview failed")
+        return func.HttpResponse(str(e), status_code=500, mimetype="text/plain")
+
+
+@app.route(route="monthly_report_send", methods=["GET"])
+def monthly_report_send(req: func.HttpRequest) -> func.HttpResponse:
+    try:
+        result = execute_monthly_report_send()
+        return func.HttpResponse(
+            json.dumps(result, ensure_ascii=False, indent=2, default=str),
+            mimetype="application/json",
+            status_code=200
+        )
+    except Exception as e:
+        logging.exception("monthly_report_send failed")
+        return func.HttpResponse(str(e), status_code=500, mimetype="text/plain")
+
+
+@app.function_name(name="monthly_report_timer")
+@app.schedule(
+    schedule="%MONTHLY_REPORT_SCHEDULE%",
+    arg_name="mytimer",
+    run_on_startup=False,
+    use_monitor=True
+)
+def monthly_report_timer(mytimer: func.TimerRequest) -> None:
+    logging.info("monthly_report_timer started. past_due=%s", mytimer.past_due if mytimer else None)
+
+    try:
+        result = execute_monthly_report_send()
+        logging.info(
+            "monthly_report_timer success: %s",
+            json.dumps(
+                {
+                    "message": result["message"],
+                    "period": result["monthly_data"]["period_kst"]
+                },
+                ensure_ascii=False
+            )
+        )
+    except Exception:
+        logging.exception("monthly_report_timer failed")
+        raise
