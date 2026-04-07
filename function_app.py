@@ -1184,7 +1184,7 @@ def build_email_html(report_text: str, compare_data: dict[str, Any]) -> str:
         <h3 style="margin:24px 0 8px;">비용 요약</h3>
         <table style="border-collapse:collapse; width:100%; max-width:700px; font-size:13px;">
           <tr style="background:#f3f4f6;">
-            <th style="border:1px solid #d1d5db; padding:8px;">항목</th>
+            <th style="border:1px solid #d1d5db; padding:8px; min-width:180px; white-space:nowrap;">항목</th>
             <th style="border:1px solid #d1d5db; padding:8px;">{prev_day["date_kst"]}</th>
             <th style="border:1px solid #d1d5db; padding:8px;">{curr_day["date_kst"]}</th>
             <th style="border:1px solid #d1d5db; padding:8px;">증감</th>
@@ -1218,7 +1218,7 @@ def build_email_html(report_text: str, compare_data: dict[str, Any]) -> str:
           <h3 style="margin:24px 0 8px;">토큰 요약</h3>
           <table style="border-collapse:collapse; width:100%; max-width:700px; font-size:13px;">
             <tr style="background:#f3f4f6;">
-              <th style="border:1px solid #d1d5db; padding:8px;">항목</th>
+              <th style="border:1px solid #d1d5db; padding:8px; min-width:180px; white-space:nowrap;">항목</th>
               <th style="border:1px solid #d1d5db; padding:8px;">{prev_day["date_kst"]}</th>
               <th style="border:1px solid #d1d5db; padding:8px;">{curr_day["date_kst"]}</th>
               <th style="border:1px solid #d1d5db; padding:8px;">증감</th>
@@ -1250,7 +1250,7 @@ def build_email_html(report_text: str, compare_data: dict[str, Any]) -> str:
           <h3 style="margin:24px 0 8px;">요청 수 요약</h3>
           <table style="border-collapse:collapse; width:100%; max-width:700px; font-size:13px;">
             <tr style="background:#f3f4f6;">
-              <th style="border:1px solid #d1d5db; padding:8px;">항목</th>
+              <th style="border:1px solid #d1d5db; padding:8px; min-width:180px; white-space:nowrap;">항목</th>
               <th style="border:1px solid #d1d5db; padding:8px;">{prev_day["date_kst"]}</th>
               <th style="border:1px solid #d1d5db; padding:8px;">{curr_day["date_kst"]}</th>
               <th style="border:1px solid #d1d5db; padding:8px;">증감</th>
@@ -1920,25 +1920,35 @@ def build_monthly_cost_html(monthly_data: dict[str, Any]) -> str:
         <p>비용 데이터는 일시적으로 조회되지 않았습니다.</p>
         """
 
-    resource_rows_html = ""
-    for row in costs.get("resource_costs", []):
-        resource_rows_html += f"""
+    daily_rows_html = ""
+    for row in costs.get("daily_rows", []):
+        day_label = row.get("date_kst") or row.get("date") or "-"
+        if isinstance(day_label, str) and len(day_label) >= 10:
+            day_label = day_label[5:10]
+        daily_rows_html += f"""
         <tr>
-          <td style="border:1px solid #d1d5db; padding:8px;">{row["resource_id"]}</td>
-          <td style="border:1px solid #d1d5db; padding:8px; text-align:right;">{format_cost_text(row["cost"], currency)}</td>
+          <td style="border:1px solid #d1d5db; padding:8px; white-space:nowrap;">{day_label}</td>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right; white-space:nowrap;">{format_cost_text(row.get("cost"), currency)}</td>
         </tr>
         """
+
+    daily_rows_html += f"""
+    <tr style="background:#f9fafb; font-weight:700;">
+      <td style="border:1px solid #d1d5db; padding:8px; white-space:nowrap;">총합</td>
+      <td style="border:1px solid #d1d5db; padding:8px; text-align:right; white-space:nowrap;">{format_cost_text(costs.get("total_cost"), currency)}</td>
+    </tr>
+    """
 
     return f"""
     <h3 style="margin:24px 0 8px;">월간 비용</h3>
     <p><strong>기간:</strong> {monthly_data["period_kst"]}</p>
-    <p><strong>총 비용:</strong> {format_cost_text(costs.get("total_cost"), currency)}</p>
-    <table style="border-collapse:collapse; width:100%; max-width:1000px; font-size:13px;">
+    <p><strong>AI 전체 비용:</strong> {format_cost_text(costs.get("total_cost"), currency)}</p>
+    <table style="border-collapse:collapse; width:auto; min-width:320px; font-size:13px; table-layout:auto;">
       <tr style="background:#f3f4f6;">
-        <th style="border:1px solid #d1d5db; padding:8px;">리소스 ID</th>
-        <th style="border:1px solid #d1d5db; padding:8px;">비용</th>
+        <th style="border:1px solid #d1d5db; padding:8px; min-width:110px;">날짜</th>
+        <th style="border:1px solid #d1d5db; padding:8px; min-width:140px;">비용</th>
       </tr>
-      {resource_rows_html}
+      {daily_rows_html}
     </table>
     """
 
@@ -1965,8 +1975,8 @@ def build_monthly_email_html(report_text: str, monthly_data: dict[str, Any]) -> 
           <h3 style="margin:24px 0 8px;">월간 요약</h3>
           <table style="border-collapse:collapse; width:100%; max-width:900px; font-size:13px;">
             <tr style="background:#f3f4f6;">
-              <th style="border:1px solid #d1d5db; padding:8px;">항목</th>
-              <th style="border:1px solid #d1d5db; padding:8px;">값</th>
+              <th style="border:1px solid #d1d5db; padding:8px; min-width:180px; white-space:nowrap;">항목</th>
+              <th style="border:1px solid #d1d5db; padding:8px; min-width:140px; white-space:nowrap;">값</th>
             </tr>
             <tr>
               <td style="border:1px solid #d1d5db; padding:8px;">Input Tokens</td>
