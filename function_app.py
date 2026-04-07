@@ -1755,6 +1755,21 @@ def build_monthly_report_data() -> dict[str, Any]:
     }
 
 
+
+
+def get_azure_openai_client():
+    endpoint = get_env("AZURE_OPENAI_ENDPOINT")
+    credential = DefaultAzureCredential()
+    token_provider = get_bearer_token_provider(
+        credential,
+        "https://cognitiveservices.azure.com/.default"
+    )
+    return AzureOpenAI(
+        azure_endpoint=endpoint,
+        api_version="2024-10-21",
+        azure_ad_token_provider=token_provider
+    )
+
 def generate_monthly_report_text(monthly_data: dict[str, Any]) -> str:
     client = get_azure_openai_client()
     deployment_name = get_env("AZURE_OPENAI_DEPLOYMENT_NAME")
