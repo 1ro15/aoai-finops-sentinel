@@ -1924,9 +1924,12 @@ def build_monthly_cost_html(monthly_data: dict[str, Any]) -> str:
 
     daily_rows_html = ""
     for row in costs.get("daily_rows", []):
-        day_label = row.get("date_kst") or row.get("date") or "-"
-        if isinstance(day_label, str) and len(day_label) >= 10:
-            day_label = day_label[5:10]
+        day_label = row.get("date_kst") or row.get("date") or row.get("usage_date") or "-"
+        if isinstance(day_label, str):
+            if len(day_label) == 8 and day_label.isdigit():
+                day_label = f"{day_label[4:6]}-{day_label[6:8]}"
+            elif len(day_label) >= 10 and day_label[4:5] == "-" and day_label[7:8] == "-":
+                day_label = day_label[5:10]
         daily_rows_html += f"""
         <tr>
           <td style="border:1px solid #d1d5db; padding:8px; white-space:nowrap;">{day_label}</td>
