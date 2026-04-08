@@ -596,6 +596,8 @@ def fetch_current_month_costs(
         f"/providers/Microsoft.CostManagement/query?api-version=2025-03-01"
     )
 
+    # 월간 리포트에서는 리소스별 상세보다 "일자별 AI 전체 비용"이 더 중요하므로
+    # Daily granularity 기준으로 날짜별 총비용만 조회한다.
     body = {
         "type": "Usage",
         "timeframe": "Custom",
@@ -610,10 +612,7 @@ def fetch_current_month_costs(
                     "name": "PreTaxCost",
                     "function": "Sum"
                 }
-            },
-            "grouping": [
-                {"type": "Dimension", "name": "ResourceId"}
-            ]
+            }
         }
     }
 
@@ -635,36 +634,39 @@ def fetch_current_month_costs(
     rows = properties.get("rows", [])
     columns = properties.get("columns", [])
 
-    resource_id_idx = find_column_index(columns, "ResourceId")
     total_cost_idx = find_column_index(columns, "totalCost", "PreTaxCost")
     currency_idx = find_column_index(columns, "Currency")
-    usage_date_idx = find_column_index(columns, "UsageDate")
-
-    normalized_resource_ids = {x.lower(): x for x in resource_ids}
+    usage_date_idx = find_column_index(columns, "UsageDate", "BillingMonth", "Date")
 
     daily_rows = []
     total_cost = 0.0
     currency = None
 
-    for row in rows:
-        row_resource_id = str(row[resource_id_idx]).lower() if resource_id_idx is not None else ""
-        if resource_ids and row_resource_id not in normalized_resource_ids:
-            continue
+    def normalize_usage_date(value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        # 20260301 형태 처리
+        if len(text) == 8 and text.isdigit():
+            return f"{text[0:4]}-{text[4:6]}-{text[6:8]}"
+        # ISO datetime / date 처리
+        if len(text) >= 10 and text[4] == "-" and text[7] == "-":
+            return text[:10]
+        return text
 
+    for row in rows:
         cost_value = float(row[total_cost_idx]) if total_cost_idx is not None else 0.0
         currency = row[currency_idx] if currency_idx is not None else currency
-        usage_date = str(row[usage_date_idx]) if usage_date_idx is not None else ""
+        usage_date = normalize_usage_date(row[usage_date_idx]) if usage_date_idx is not None else ""
 
         daily_rows.append({
-            "usage_date": usage_date,
-            "resource_id": normalized_resource_ids.get(row_resource_id, row_resource_id),
+            "date": usage_date,
             "cost": cost_value,
             "currency": currency
         })
-
         total_cost += cost_value
 
-    daily_rows.sort(key=lambda x: (x["usage_date"], x["resource_id"]))
+    daily_rows.sort(key=lambda x: x["date"] or "")
 
     return {
         "period_kst": f"{start_kst_str} ~ {end_kst_str}",
@@ -1109,7 +1111,7 @@ def build_model_breakdown_html(compare_data: dict[str, Any]) -> str:
 
     return f"""
     <h3 style="margin:24px 0 8px;">모델별 토큰 및 요청 비교 (모델 기준 통합)</h3>
-    <table style="border-collapse:collapse; width:100%; max-width:900px; font-size:13px;">
+    <table style="border-collapse:collapse; width:auto; min-width:420px; font-size:13px; table-layout:auto;">
       {rows_html}
     </table>
     """
@@ -1973,7 +1975,7 @@ def build_monthly_email_html(report_text: str, monthly_data: dict[str, Any]) -> 
           <div style="background:#f3f4f6; border-radius:8px; padding:16px; white-space:pre-wrap; line-height:1.6;">{report_text}</div>
 
           <h3 style="margin:24px 0 8px;">월간 요약</h3>
-          <table style="border-collapse:collapse; width:100%; max-width:900px; font-size:13px;">
+          <table style="border-collapse:collapse; width:auto; min-width:420px; font-size:13px; table-layout:auto;">
             <tr style="background:#f3f4f6;">
               <th style="border:1px solid #d1d5db; padding:8px; min-width:180px; white-space:nowrap;">항목</th>
               <th style="border:1px solid #d1d5db; padding:8px; min-width:140px; white-space:nowrap;">값</th>
