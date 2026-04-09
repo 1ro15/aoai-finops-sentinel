@@ -596,8 +596,6 @@ def fetch_current_month_costs(
         f"/providers/Microsoft.CostManagement/query?api-version=2025-03-01"
     )
 
-    # 월간 리포트에서는 리소스별 상세보다 "일자별 AI 전체 비용"이 더 중요하므로
-    # Daily granularity 기준으로 날짜별 총비용만 조회한다.
     body = {
         "type": "Usage",
         "timeframe": "Custom",
@@ -612,7 +610,15 @@ def fetch_current_month_costs(
                     "name": "PreTaxCost",
                     "function": "Sum"
                 }
-            }
+            },
+            # 일부 환경에서는 Daily granularity여도 resource/date 조합으로 여러 행이 내려올 수 있어
+            # 렌더링 전에 날짜 기준으로 다시 합산한다.
+            "grouping": [
+                {
+                    "type": "Dimension",
+                    "name": "ResourceId"
+                }
+            ]
         }
     }
 
@@ -638,7 +644,6 @@ def fetch_current_month_costs(
     currency_idx = find_column_index(columns, "Currency")
     usage_date_idx = find_column_index(columns, "UsageDate", "BillingMonth", "Date")
 
-    daily_rows = []
     total_cost = 0.0
     currency = None
 
@@ -646,27 +651,32 @@ def fetch_current_month_costs(
         text = str(value or "").strip()
         if not text:
             return ""
-        # 20260301 형태 처리
         if len(text) == 8 and text.isdigit():
             return f"{text[0:4]}-{text[4:6]}-{text[6:8]}"
-        # ISO datetime / date 처리
         if len(text) >= 10 and text[4] == "-" and text[7] == "-":
             return text[:10]
         return text
+
+    daily_cost_map: dict[str, float] = {}
 
     for row in rows:
         cost_value = float(row[total_cost_idx]) if total_cost_idx is not None else 0.0
         currency = row[currency_idx] if currency_idx is not None else currency
         usage_date = normalize_usage_date(row[usage_date_idx]) if usage_date_idx is not None else ""
 
-        daily_rows.append({
-            "date": usage_date,
-            "cost": cost_value,
-            "currency": currency
-        })
+        if usage_date not in daily_cost_map:
+            daily_cost_map[usage_date] = 0.0
+        daily_cost_map[usage_date] += cost_value
         total_cost += cost_value
 
-    daily_rows.sort(key=lambda x: x["date"] or "")
+    daily_rows = [
+        {
+            "date": date_key,
+            "cost": cost_value,
+            "currency": currency
+        }
+        for date_key, cost_value in sorted(daily_cost_map.items(), key=lambda x: x[0] or "")
+    ]
 
     return {
         "period_kst": f"{start_kst_str} ~ {end_kst_str}",
