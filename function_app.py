@@ -1819,7 +1819,7 @@ def generate_monthly_report_text(monthly_data: dict[str, Any]) -> str:
 """
 
     user_prompt = f"""
-다음 JSON 데이터를 기반으로 Azure OpenAI 월간 리포트를 한국어로 작성해줘.
+다음 JSON 데이터를 기반으로 AOAI FinOps Sentinel 월간 리포트를 한국어로 작성해줘.
 
 중요:
 - 비용은 cost_total_text 값을 그대로 사용해.
@@ -1982,7 +1982,7 @@ def build_monthly_email_html(report_text: str, monthly_data: dict[str, Any]) -> 
     <html>
       <body style="font-family:Arial, sans-serif; color:#111827; background:#f9fafb; margin:0; padding:24px;">
         <div style="max-width:1200px; margin:0 auto; background:white; border:1px solid #e5e7eb; border-radius:12px; padding:24px;">
-          <h2 style="margin-top:0;">Azure OpenAI 월간 리포트</h2>
+          <h2 style="margin-top:0;">AOAI FinOps Sentinel 월간 리포트</h2>
           <p style="color:#6b7280; margin-top:-8px;">대상 기간: {monthly_data["period_kst"]}</p>
 
           <div style="background:#f3f4f6; border-radius:8px; padding:16px; white-space:pre-wrap; line-height:1.6;">{report_text}</div>
@@ -2034,7 +2034,7 @@ def execute_monthly_report_send() -> dict[str, Any]:
     report_text = generate_monthly_report_text(monthly_data)
     html_body = build_monthly_email_html(report_text, monthly_data)
 
-    subject = f"[AOAI FinOps Sentinel] Azure OpenAI 월간 리포트 - {monthly_data['month']}"
+    subject = f"[AOAI FinOps Sentinel] AOAI FinOps Sentinel 월간 리포트 - {monthly_data['month']}"
     send_result = send_email(subject, html_body)
 
     return {
