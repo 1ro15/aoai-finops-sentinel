@@ -1932,18 +1932,31 @@ def build_monthly_cost_html(monthly_data: dict[str, Any]) -> str:
         <p>비용 데이터는 일시적으로 조회되지 않았습니다.</p>
         """
 
-    daily_rows_html = ""
+    def normalize_day_label(value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return "-"
+        if len(text) == 8 and text.isdigit():
+            return f"{text[4:6]}-{text[6:8]}"
+        if len(text) >= 10 and text[4:5] == "-" and text[7:8] == "-":
+            return text[5:10]
+        return text
+
+    # 최종 렌더링 시점에서도 날짜 기준 재합산하여,
+    # 동일 날짜가 여러 리소스로 나뉘어 내려와도 한 줄로 표시되게 한다.
+    merged_daily_costs: dict[str, float] = {}
     for row in costs.get("daily_rows", []):
-        day_label = row.get("date_kst") or row.get("date") or row.get("usage_date") or "-"
-        if isinstance(day_label, str):
-            if len(day_label) == 8 and day_label.isdigit():
-                day_label = f"{day_label[4:6]}-{day_label[6:8]}"
-            elif len(day_label) >= 10 and day_label[4:5] == "-" and day_label[7:8] == "-":
-                day_label = day_label[5:10]
+        day_label = normalize_day_label(
+            row.get("date_kst") or row.get("date") or row.get("usage_date")
+        )
+        merged_daily_costs[day_label] = merged_daily_costs.get(day_label, 0.0) + float(row.get("cost", 0.0) or 0.0)
+
+    daily_rows_html = ""
+    for day_label, merged_cost in sorted(merged_daily_costs.items(), key=lambda x: x[0]):
         daily_rows_html += f"""
         <tr>
           <td style="border:1px solid #d1d5db; padding:8px; white-space:nowrap;">{day_label}</td>
-          <td style="border:1px solid #d1d5db; padding:8px; text-align:right; white-space:nowrap;">{format_cost_text(row.get("cost"), currency)}</td>
+          <td style="border:1px solid #d1d5db; padding:8px; text-align:right; white-space:nowrap;">{format_cost_text(merged_cost, currency)}</td>
         </tr>
         """
 
