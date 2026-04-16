@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AOAI FinOps Sentinel Chat</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div class="container">
+    <h1>AOAI FinOps Sentinel</h1>
+    <p class="subtitle">Azure OpenAI 사용량 질의 챗봇</p>
+
+    <div id="chat-box" class="chat-box">
+      <div class="message bot">
+        안녕하세요. 기간을 지정해서 사용량을 조회해보세요.
+      </div>
+    </div>
+
+    <div class="input-row">
+      <input
+        type="text"
+        id="user-input"
+        placeholder='예: 3월 1일부터 3월 5일까지 사용량 조회해서 알려줘'
+      />
+      <button id="send-button">전송</button>
+    </div>
+  </div>
+
+  <script src="./app.js"></script>
+</body>
+</html>
