@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import smtplib
 import time
 from datetime import datetime, timedelta, timezone
@@ -2137,21 +2138,322 @@ def monthly_report_timer(mytimer: func.TimerRequest) -> None:
 
 
 # -----------------------------
-# Chat API - Static Web Apps Frontend 테스트용
+# Chat API - Static Web Apps Frontend 질의형 리포트 API
 # -----------------------------
+def parse_chat_date_range(message: str) -> tuple[datetime, datetime, str, str]:
+    """
+    사용자의 한국어/숫자형 날짜 표현을 KST 기준 시작/종료 일자로 변환합니다.
+
+    지원 예:
+    - 2026-04-01부터 2026-04-05까지
+    - 2026년 4월 1일부터 4월 5일까지
+    - 4월 1일부터 4월 5일까지
+    - 4/1부터 4/5까지
+
+    반환:
+    - start_kst: 시작일 00:00 KST
+    - end_kst_exclusive: 종료일 다음날 00:00 KST
+    - start_label: YYYY-MM-DD
+    - end_label: YYYY-MM-DD
+    """
+    now_kst = datetime.now(KST)
+    default_year = now_kst.year
+
+    text = message.strip()
+
+    # 1) YYYY-MM-DD / YYYY.MM.DD / YYYY/MM/DD 형식
+    full_dates = re.findall(r"(20\d{2})[-./](\d{1,2})[-./](\d{1,2})", text)
+    if len(full_dates) >= 2:
+        y1, m1, d1 = map(int, full_dates[0])
+        y2, m2, d2 = map(int, full_dates[1])
+    else:
+        # 2) YYYY년 M월 D일 + M월 D일 형태
+        first_with_year = re.search(r"(20\d{2})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일", text)
+        month_day_pairs = re.findall(r"(\d{1,2})\s*월\s*(\d{1,2})\s*일", text)
+
+        if first_with_year and len(month_day_pairs) >= 2:
+            y1 = int(first_with_year.group(1))
+            m1 = int(month_day_pairs[0][0])
+            d1 = int(month_day_pairs[0][1])
+            y2 = y1
+            m2 = int(month_day_pairs[1][0])
+            d2 = int(month_day_pairs[1][1])
+        elif len(month_day_pairs) >= 2:
+            y1 = y2 = default_year
+            m1 = int(month_day_pairs[0][0])
+            d1 = int(month_day_pairs[0][1])
+            m2 = int(month_day_pairs[1][0])
+            d2 = int(month_day_pairs[1][1])
+        else:
+            # 3) M/D 형태
+            slash_pairs = re.findall(r"(?<!\d)(\d{1,2})/(\d{1,2})(?!\d)", text)
+            if len(slash_pairs) >= 2:
+                y1 = y2 = default_year
+                m1 = int(slash_pairs[0][0])
+                d1 = int(slash_pairs[0][1])
+                m2 = int(slash_pairs[1][0])
+                d2 = int(slash_pairs[1][1])
+            else:
+                raise ValueError(
+                    "조회 기간을 찾지 못했습니다. 예: '4월 1일부터 4월 5일까지 사용량 알려줘'처럼 입력해주세요."
+                )
+
+    start_kst = datetime(y1, m1, d1, 0, 0, 0, tzinfo=KST)
+    end_kst_inclusive = datetime(y2, m2, d2, 0, 0, 0, tzinfo=KST)
+
+    if end_kst_inclusive < start_kst:
+        raise ValueError("종료일이 시작일보다 빠릅니다. 조회 기간을 다시 확인해주세요.")
+
+    end_kst_exclusive = end_kst_inclusive + timedelta(days=1)
+
+    # Azure Monitor Metrics는 장기 보관 한계가 있으므로 90일 초과 조회를 차단합니다.
+    oldest_allowed = now_kst - timedelta(days=90)
+    if start_kst < oldest_allowed:
+        raise ValueError(
+            f"Azure Monitor 메트릭은 최근 90일 이내 기간만 조회하도록 제한했습니다. "
+            f"조회 시작일({start_kst.strftime('%Y-%m-%d')})을 최근 90일 이내로 지정해주세요."
+        )
+
+    if (end_kst_exclusive - start_kst).days > 90:
+        raise ValueError("한 번에 조회 가능한 기간은 최대 90일입니다. 기간을 나누어 요청해주세요.")
+
+    # 미래 날짜도 차단
+    tomorrow_kst = datetime(now_kst.year, now_kst.month, now_kst.day, 0, 0, 0, tzinfo=KST) + timedelta(days=1)
+    if start_kst >= tomorrow_kst:
+        raise ValueError("미래 날짜는 조회할 수 없습니다.")
+
+    if end_kst_exclusive > tomorrow_kst:
+        end_kst_exclusive = tomorrow_kst
+        end_kst_inclusive = tomorrow_kst - timedelta(days=1)
+
+    return (
+        start_kst,
+        end_kst_exclusive,
+        start_kst.strftime("%Y-%m-%d"),
+        end_kst_inclusive.strftime("%Y-%m-%d"),
+    )
+
+
+def is_mail_request(message: str) -> bool:
+    keywords = ["메일", "이메일", "mail", "email", "보내줘", "발송"]
+    return any(keyword.lower() in message.lower() for keyword in keywords)
+
+
+def build_chat_usage_report_data(message: str) -> dict[str, Any]:
+    start_kst, end_kst_exclusive, start_label, end_label = parse_chat_date_range(message)
+
+    start_utc = start_kst.astimezone(timezone.utc)
+    end_utc = end_kst_exclusive.astimezone(timezone.utc)
+
+    credential = DefaultAzureCredential()
+    resources = load_resources()
+    deployment_model_map = load_deployment_model_map()
+    subscription_id = get_env("SUBSCRIPTION_ID")
+
+    metrics = fetch_metrics_for_custom_range(
+        credential=credential,
+        resources=resources,
+        start_time_utc=start_utc,
+        end_time_utc=end_utc,
+        deployment_model_map=deployment_model_map,
+    )
+
+    resource_ids = [resource["resource_id"] for resource in resources]
+    costs = fetch_costs_for_custom_range(
+        credential=credential,
+        subscription_id=subscription_id,
+        resource_ids=resource_ids,
+        start_time_utc=start_utc,
+        end_time_utc=end_utc,
+        period_label=f"{start_label} ~ {end_label}",
+        start_kst_str=start_label,
+        end_kst_str=end_label,
+    )
+
+    return {
+        "query": message,
+        "period_kst": f"{start_label} ~ {end_label}",
+        "start_date_kst": start_label,
+        "end_date_kst": end_label,
+        "start_time_utc": start_utc.isoformat(),
+        "end_time_utc": end_utc.isoformat(),
+        "metrics": metrics,
+        "costs": costs,
+    }
+
+
+def generate_chat_usage_summary(report_data: dict[str, Any]) -> str:
+    try:
+        client = get_azure_openai_client()
+        deployment_name = get_env("AZURE_OPENAI_DEPLOYMENT_NAME")
+
+        metrics = report_data["metrics"]
+        costs = report_data["costs"]
+        summary = metrics.get("summary", {})
+        currency = costs.get("currency")
+
+        lightweight_data = {
+            "period_kst": report_data["period_kst"],
+            "query": report_data["query"],
+            "summary": summary,
+            "cost_total_text": format_cost_text(costs.get("total_cost"), currency),
+            "top_models": metrics.get("model_summary", [])[:5],
+        }
+
+        system_prompt = """
+너는 Azure OpenAI 사용량을 분석하는 FinOps Agent다.
+사용자 질의에 대해 지정 기간의 사용량을 간결한 한국어로 요약한다.
+
+규칙:
+1. 데이터에 근거해서만 말한다.
+2. 5문장 이내로 작성한다.
+3. 기간, 총 토큰, 요청 수, 비용을 포함한다.
+4. 모델별 상위 사용량이 있으면 canonical model 기준으로 언급한다.
+5. 비용은 cost_total_text 값을 그대로 사용한다.
+"""
+
+        user_prompt = f"""
+다음 데이터를 기반으로 채팅 응답용 사용량 요약을 작성해줘.
+
+데이터:
+{json.dumps(lightweight_data, ensure_ascii=False, indent=2)}
+"""
+
+        response = client.chat.completions.create(
+            model=deployment_name,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.1,
+            max_tokens=500,
+        )
+        return add_line_breaks(response.choices[0].message.content.strip())
+
+    except Exception as e:
+        logging.exception("generate_chat_usage_summary failed")
+        summary = report_data["metrics"].get("summary", {})
+        costs = report_data["costs"]
+        return (
+            f"{report_data['period_kst']} 기준 Azure OpenAI 사용량입니다.<br>"
+            f"총 토큰은 {format_number(summary.get('total_tokens'))}, "
+            f"입력 토큰은 {format_number(summary.get('prompt_tokens'))}, "
+            f"출력 토큰은 {format_number(summary.get('completion_tokens'))}, "
+            f"요청 수는 {format_number(summary.get('request_count'))}건입니다.<br>"
+            f"총 비용은 {format_cost_text(costs.get('total_cost'), costs.get('currency'))}입니다."
+        )
+
+
+def build_chat_usage_report_html(report_text: str, report_data: dict[str, Any]) -> str:
+    metrics = report_data["metrics"]
+    costs = report_data["costs"]
+    summary = metrics.get("summary", {})
+    currency = costs.get("currency")
+
+    model_rows = ""
+    for item in metrics.get("model_summary", []):
+        model_rows += f"""
+        <tr>
+          <td>{item.get("model_name", "-")}</td>
+          <td>{", ".join(item.get("regions", []))}</td>
+          <td>{", ".join(item.get("deployments", []))}</td>
+          <td style="text-align:right;">{format_number(item.get("prompt_tokens"))}</td>
+          <td style="text-align:right;">{format_number(item.get("completion_tokens"))}</td>
+          <td style="text-align:right;">{format_number(item.get("total_tokens"))}</td>
+          <td style="text-align:right;">{format_number(item.get("request_count"))}</td>
+        </tr>
+        """
+
+    if not model_rows:
+        model_rows = """
+        <tr>
+          <td colspan="7">조회된 모델 사용량이 없습니다.</td>
+        </tr>
+        """
+
+    deployment_rows = ""
+    for item in metrics.get("items", []):
+        deployment_rows += f"""
+        <tr>
+          <td>{item.get("region", "-")}</td>
+          <td>{item.get("model_name", "-")}</td>
+          <td>{item.get("model_deployment_name", "-")}</td>
+          <td style="text-align:right;">{format_number(item.get("total_tokens"))}</td>
+          <td style="text-align:right;">{format_number(item.get("request_count"))}</td>
+        </tr>
+        """
+
+    if not deployment_rows:
+        deployment_rows = """
+        <tr>
+          <td colspan="5">조회된 리전/배포별 사용량이 없습니다.</td>
+        </tr>
+        """
+
+    html = f"""
+    <div class="report-card">
+      <h3>사용량 조회 결과</h3>
+      <p><strong>조회 기간:</strong> {report_data["period_kst"]} (KST)</p>
+
+      <div class="report-summary">
+        {report_text}
+      </div>
+
+      <h4>전체 요약</h4>
+      <table class="report-table">
+        <tr><th>항목</th><th>값</th></tr>
+        <tr><td>Input Tokens</td><td style="text-align:right;">{format_number(summary.get("prompt_tokens"))}</td></tr>
+        <tr><td>Output Tokens</td><td style="text-align:right;">{format_number(summary.get("completion_tokens"))}</td></tr>
+        <tr><td>Total Tokens</td><td style="text-align:right;">{format_number(summary.get("total_tokens"))}</td></tr>
+        <tr><td>Requests</td><td style="text-align:right;">{format_number(summary.get("request_count"))}</td></tr>
+        <tr><td>Total Cost</td><td style="text-align:right;">{format_cost_text(costs.get("total_cost"), currency)}</td></tr>
+      </table>
+
+      <h4>모델별 사용량</h4>
+      <table class="report-table">
+        <tr>
+          <th>모델명</th>
+          <th>리전</th>
+          <th>포함된 배포명</th>
+          <th>Input</th>
+          <th>Output</th>
+          <th>Total</th>
+          <th>Requests</th>
+        </tr>
+        {model_rows}
+      </table>
+
+      <h4>리전/배포별 사용량</h4>
+      <table class="report-table">
+        <tr>
+          <th>리전</th>
+          <th>모델명</th>
+          <th>배포명</th>
+          <th>Total Tokens</th>
+          <th>Requests</th>
+        </tr>
+        {deployment_rows}
+      </table>
+    </div>
+    """
+    return html
+
+
 @app.route(route="chat_query", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
 def chat_query(req: func.HttpRequest) -> func.HttpResponse:
     """
-    Azure Static Web Apps 프론트엔드와 Azure Function 백엔드 연결 테스트용 API입니다.
+    Static Web Apps 챗봇 질의 API입니다.
 
-    수정 포인트:
-    - SWA에서 호출할 수 있도록 auth_level=ANONYMOUS 명시
-    - PowerShell/브라우저/프론트에서 body 파싱이 다르게 들어와도 처리되도록 raw body fallback 추가
+    기능:
+    - 자연어에서 날짜 범위 추출
+    - 90일 초과/오래된 기간 차단
+    - 토큰/요청/비용 조회
+    - 채팅 화면용 HTML 리포트 반환
+    - '메일로 보내줘' 요청 시 동일 리포트를 메일 발송
     """
     try:
         body = {}
 
-        # 1차: Azure Functions 기본 JSON 파싱
         try:
             parsed = req.get_json()
             if isinstance(parsed, dict):
@@ -2159,7 +2461,6 @@ def chat_query(req: func.HttpRequest) -> func.HttpResponse:
         except Exception:
             body = {}
 
-        # 2차: raw body 직접 파싱 fallback
         if not body:
             try:
                 raw_body = req.get_body()
@@ -2171,7 +2472,6 @@ def chat_query(req: func.HttpRequest) -> func.HttpResponse:
             except Exception:
                 body = {}
 
-        # 3차: query string fallback
         user_message = (
             body.get("message")
             or body.get("question")
@@ -2186,30 +2486,61 @@ def chat_query(req: func.HttpRequest) -> func.HttpResponse:
             return func.HttpResponse(
                 json.dumps({
                     "status": "error",
-                    "answer": "질문 내용이 비어 있습니다.",
-                    "debug": {
-                        "body_keys": list(body.keys()) if isinstance(body, dict) else [],
-                        "content_type": req.headers.get("content-type")
-                    }
+                    "answer": "질문 내용이 비어 있습니다. 예: '4월 1일부터 4월 5일까지 사용량 알려줘'",
+                    "answer_html": "<p>질문 내용이 비어 있습니다.</p>",
                 }, ensure_ascii=False),
                 status_code=400,
                 mimetype="application/json"
             )
 
-        answer = (
-            "질문을 정상적으로 받았습니다.\n\n"
-            f"입력한 질문: {user_message}\n\n"
-            "현재는 Static Web Apps 프론트엔드와 Azure Function 백엔드 연결 테스트 단계입니다. "
-            "다음 단계에서 이 API에 사용량 조회, 요청 수 조회, 비용 조회, 메일 발송 기능을 연결할 예정입니다."
-        )
+        report_data = build_chat_usage_report_data(user_message)
+        report_text = generate_chat_usage_summary(report_data)
+        report_html = build_chat_usage_report_html(report_text, report_data)
+
+        mail_sent = False
+        mail_result = None
+
+        if is_mail_request(user_message):
+            subject = f"[AOAI FinOps Sentinel] 질의형 사용량 리포트 - {report_data['period_kst']}"
+            full_html = f"""
+            <html>
+              <body style="font-family:Arial, sans-serif;">
+                <h2>AOAI FinOps Sentinel 질의형 사용량 리포트</h2>
+                {report_html}
+                <p style="margin-top:24px; color:#6b7280; font-size:12px;">
+                  This report was generated by AOAI FinOps Sentinel Chat Agent.
+                </p>
+              </body>
+            </html>
+            """
+            mail_result = send_email(subject, full_html)
+            mail_sent = True
+
+        final_answer = report_text
+        if mail_sent:
+            final_answer += "<br><br>요청하신 리포트를 메일로 발송했습니다."
 
         return func.HttpResponse(
             json.dumps({
                 "status": "ok",
-                "answer": answer,
-                "received_message": user_message
-            }, ensure_ascii=False),
+                "answer": final_answer,
+                "answer_html": report_html + ("<p><strong>메일 발송 완료</strong></p>" if mail_sent else ""),
+                "mail_sent": mail_sent,
+                "mail_result": mail_result,
+                "report_data": report_data,
+            }, ensure_ascii=False, default=str),
             status_code=200,
+            mimetype="application/json"
+        )
+
+    except ValueError as e:
+        return func.HttpResponse(
+            json.dumps({
+                "status": "error",
+                "answer": str(e),
+                "answer_html": f"<p>{str(e)}</p>",
+            }, ensure_ascii=False),
+            status_code=400,
             mimetype="application/json"
         )
 
@@ -2218,7 +2549,8 @@ def chat_query(req: func.HttpRequest) -> func.HttpResponse:
         return func.HttpResponse(
             json.dumps({
                 "status": "error",
-                "answer": f"chat_query 처리 중 오류가 발생했습니다: {str(e)}"
+                "answer": f"chat_query 처리 중 오류가 발생했습니다: {str(e)}",
+                "answer_html": f"<p>chat_query 처리 중 오류가 발생했습니다: {str(e)}</p>",
             }, ensure_ascii=False),
             status_code=500,
             mimetype="application/json"

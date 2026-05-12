@@ -2,10 +2,16 @@ const chatBox = document.getElementById("chat-box");
 const userInput = document.getElementById("user-input");
 const sendButton = document.getElementById("send-button");
 
-function addMessage(text, sender) {
+function addMessage(content, sender, isHtml = false) {
   const div = document.createElement("div");
   div.className = `message ${sender}`;
-  div.textContent = text;
+
+  if (isHtml) {
+    div.innerHTML = content;
+  } else {
+    div.textContent = content;
+  }
+
   chatBox.appendChild(div);
   chatBox.scrollTop = chatBox.scrollHeight;
 }
@@ -24,10 +30,6 @@ async function sendMessage() {
   sendButton.textContent = "조회 중...";
 
   try {
-    /*
-      Azure Static Web Apps에 Azure Function을 연결하면
-      프론트에서는 /api/chat_query 로 호출 가능
-    */
     const response = await fetch("/api/chat_query", {
       method: "POST",
       headers: {
@@ -42,15 +44,17 @@ async function sendMessage() {
 
     if (!response.ok) {
       addMessage(
-        data.answer || data.error || "API 호출 중 오류가 발생했습니다.",
-        "bot"
+        data.answer_html || data.answer || data.error || "API 호출 중 오류가 발생했습니다.",
+        "bot",
+        Boolean(data.answer_html)
       );
       return;
     }
 
     addMessage(
-      data.answer || "응답이 비어 있습니다.",
-      "bot"
+      data.answer_html || data.answer || "응답이 비어 있습니다.",
+      "bot",
+      Boolean(data.answer_html)
     );
 
   } catch (error) {
