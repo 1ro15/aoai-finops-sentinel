@@ -1292,17 +1292,75 @@ def build_email_html(report_text: str, compare_data: dict[str, Any]) -> str:
     return html
 
 
-def send_email(subject: str, html_body: str) -> dict[str, Any]:
-    mail_from = get_env("MAIL_FROM")
+def resolve_mail_recipients(target_keyword: str | None = None) -> list[str]:
+    """
+    MAIL_TO 환경 변수에 등록된 수신자 목록에서 선택 발송 대상을 결정합니다.
+
+    - target_keyword가 없으면 MAIL_TO 전체에게 발송
+    - target_keyword가 있으면 이메일 주소 또는 @ 앞 local-part에 해당 문자열이 포함된 수신자에게만 발송
+      예: MAIL_TO = aaaa@gmail.com,aaaa@naver.com,bbbb@naver.com
+          사용자 질의 = "aaaa로 메일 보내줘"
+          결과 = aaaa@gmail.com, aaaa@naver.com
+    """
     mail_to_raw = get_env("MAIL_TO")
+    recipients = [addr.strip() for addr in mail_to_raw.split(",") if addr.strip()]
+
+    if not recipients:
+        raise ValueError("MAIL_TO에 유효한 수신자가 없습니다.")
+
+    if not target_keyword:
+        return recipients
+
+    keyword = target_keyword.strip().lower()
+    matched = []
+
+    for addr in recipients:
+        addr_lower = addr.lower()
+        local_part = addr_lower.split("@")[0]
+        if keyword in local_part or keyword in addr_lower:
+            matched.append(addr)
+
+    if not matched:
+        raise ValueError(
+            f"'{target_keyword}' 조건에 맞는 수신자를 MAIL_TO에서 찾지 못했습니다. "
+            "등록된 메일 주소의 @ 앞 계정명 또는 전체 주소에 포함된 문자열로 요청해주세요."
+        )
+
+    return matched
+
+
+def extract_mail_target_keyword(message: str) -> str | None:
+    """
+    'aaaa로 메일 보내줘', 'aaaa에게 이메일 발송', 'aaaa한테 메일' 같은 표현에서
+    선택 발송 대상 키워드를 추출합니다.
+    """
+    patterns = [
+        r"([A-Za-z0-9._+-]+)\s*(?:에게|한테|로|으로)\s*(?:메일|이메일|mail|email)",
+        r"(?:메일|이메일|mail|email)\s*(?:을|를)?\s*([A-Za-z0-9._+-]+)\s*(?:에게|한테|로|으로)",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, message, flags=re.IGNORECASE)
+        if match:
+            keyword = match.group(1).strip()
+            # 너무 일반적인 단어가 잡히는 것 방지
+            if keyword.lower() not in ["메일", "이메일", "mail", "email"]:
+                return keyword
+
+    return None
+
+
+def send_email(subject: str, html_body: str, recipients_override: list[str] | None = None) -> dict[str, Any]:
+    mail_from = get_env("MAIL_FROM")
     smtp_host = get_env("SMTP_HOST")
     smtp_port = int(get_env("SMTP_PORT"))
     smtp_username = get_env("SMTP_USERNAME")
     smtp_password = get_env("SMTP_PASSWORD")
 
-    recipients = [addr.strip() for addr in mail_to_raw.split(",") if addr.strip()]
+    recipients = recipients_override if recipients_override else resolve_mail_recipients()
+
     if not recipients:
-        raise ValueError("MAIL_TO에 유효한 수신자가 없습니다.")
+        raise ValueError("유효한 수신자가 없습니다.")
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
@@ -2355,24 +2413,29 @@ def build_chat_usage_report_html(report_text: str, report_data: dict[str, Any]) 
     summary = metrics.get("summary", {})
     currency = costs.get("currency")
 
+    table_style = "border-collapse:collapse; width:100%; max-width:900px; font-size:13px; margin:8px 0 20px;"
+    th_style = "border:1px solid #d1d5db; padding:8px; background:#f3f4f6; white-space:nowrap; text-align:center;"
+    td_style = "border:1px solid #d1d5db; padding:8px; white-space:nowrap;"
+    td_right = "border:1px solid #d1d5db; padding:8px; text-align:right; white-space:nowrap;"
+
     model_rows = ""
     for item in metrics.get("model_summary", []):
         model_rows += f"""
         <tr>
-          <td>{item.get("model_name", "-")}</td>
-          <td>{", ".join(item.get("regions", []))}</td>
-          <td>{", ".join(item.get("deployments", []))}</td>
-          <td style="text-align:right;">{format_number(item.get("prompt_tokens"))}</td>
-          <td style="text-align:right;">{format_number(item.get("completion_tokens"))}</td>
-          <td style="text-align:right;">{format_number(item.get("total_tokens"))}</td>
-          <td style="text-align:right;">{format_number(item.get("request_count"))}</td>
+          <td style="{td_style}">{item.get("model_name", "-")}</td>
+          <td style="{td_style}">{", ".join(item.get("regions", []))}</td>
+          <td style="{td_style}">{", ".join(item.get("deployments", []))}</td>
+          <td style="{td_right}">{format_number(item.get("prompt_tokens"))}</td>
+          <td style="{td_right}">{format_number(item.get("completion_tokens"))}</td>
+          <td style="{td_right}">{format_number(item.get("total_tokens"))}</td>
+          <td style="{td_right}">{format_number(item.get("request_count"))}</td>
         </tr>
         """
 
     if not model_rows:
-        model_rows = """
+        model_rows = f"""
         <tr>
-          <td colspan="7">조회된 모델 사용량이 없습니다.</td>
+          <td colspan="7" style="{td_style}">조회된 모델 사용량이 없습니다.</td>
         </tr>
         """
 
@@ -2380,62 +2443,70 @@ def build_chat_usage_report_html(report_text: str, report_data: dict[str, Any]) 
     for item in metrics.get("items", []):
         deployment_rows += f"""
         <tr>
-          <td>{item.get("region", "-")}</td>
-          <td>{item.get("model_name", "-")}</td>
-          <td>{item.get("model_deployment_name", "-")}</td>
-          <td style="text-align:right;">{format_number(item.get("total_tokens"))}</td>
-          <td style="text-align:right;">{format_number(item.get("request_count"))}</td>
+          <td style="{td_style}">{item.get("region", "-")}</td>
+          <td style="{td_style}">{item.get("model_name", "-")}</td>
+          <td style="{td_style}">{item.get("model_deployment_name", "-")}</td>
+          <td style="{td_right}">{format_number(item.get("prompt_tokens"))}</td>
+          <td style="{td_right}">{format_number(item.get("completion_tokens"))}</td>
+          <td style="{td_right}">{format_number(item.get("total_tokens"))}</td>
+          <td style="{td_right}">{format_number(item.get("request_count"))}</td>
         </tr>
         """
 
     if not deployment_rows:
-        deployment_rows = """
+        deployment_rows = f"""
         <tr>
-          <td colspan="5">조회된 리전/배포별 사용량이 없습니다.</td>
+          <td colspan="7" style="{td_style}">조회된 리전/배포별 사용량이 없습니다.</td>
         </tr>
         """
 
     html = f"""
-    <div class="report-card">
-      <h3>사용량 조회 결과</h3>
-      <p><strong>조회 기간:</strong> {report_data["period_kst"]} (KST)</p>
+    <div style="font-family:Arial, sans-serif; color:#111827; line-height:1.5;">
+      <h2 style="margin:0 0 12px;">AOAI FinOps Sentinel 질의형 사용량 리포트</h2>
+      <p style="margin:0 0 20px; color:#374151;">조회 기간: {report_data["period_kst"]} (KST)</p>
 
-      <div class="report-summary">
+      <h3 style="margin:24px 0 8px;">요약</h3>
+      <div style="background:#f3f4f6; border-radius:8px; padding:14px; max-width:900px; margin-bottom:20px;">
         {report_text}
       </div>
 
-      <h4>전체 요약</h4>
-      <table class="report-table">
-        <tr><th>항목</th><th>값</th></tr>
-        <tr><td>Input Tokens</td><td style="text-align:right;">{format_number(summary.get("prompt_tokens"))}</td></tr>
-        <tr><td>Output Tokens</td><td style="text-align:right;">{format_number(summary.get("completion_tokens"))}</td></tr>
-        <tr><td>Total Tokens</td><td style="text-align:right;">{format_number(summary.get("total_tokens"))}</td></tr>
-        <tr><td>Requests</td><td style="text-align:right;">{format_number(summary.get("request_count"))}</td></tr>
-        <tr><td>Total Cost</td><td style="text-align:right;">{format_cost_text(costs.get("total_cost"), currency)}</td></tr>
+      <h3 style="margin:24px 0 8px;">사용량 요약</h3>
+      <table style="border-collapse:collapse; width:100%; max-width:700px; font-size:13px; margin:8px 0 20px;">
+        <tr>
+          <th style="{th_style}">항목</th>
+          <th style="{th_style}">값</th>
+        </tr>
+        <tr><td style="{td_style}">Input Tokens</td><td style="{td_right}">{format_number(summary.get("prompt_tokens"))}</td></tr>
+        <tr><td style="{td_style}">Output Tokens</td><td style="{td_right}">{format_number(summary.get("completion_tokens"))}</td></tr>
+        <tr><td style="{td_style}">Total Tokens</td><td style="{td_right}">{format_number(summary.get("total_tokens"))}</td></tr>
+        <tr><td style="{td_style}">Requests</td><td style="{td_right}">{format_number(summary.get("request_count"))}</td></tr>
+        <tr><td style="{td_style}">Total Cost</td><td style="{td_right}">{format_cost_text(costs.get("total_cost"), currency)}</td></tr>
       </table>
 
-      <h4>모델별 사용량</h4>
-      <table class="report-table">
+      <h3 style="margin:24px 0 8px;">모델별 사용량</h3>
+      <table style="{table_style}">
         <tr>
-          <th>모델명</th>
-          <th>리전</th>
-          <th>포함된 배포명</th>
-          <th>Input</th>
-          <th>Output</th>
-          <th>Total</th>
-          <th>Requests</th>
+          <th style="{th_style}">모델명</th>
+          <th style="{th_style}">리전</th>
+          <th style="{th_style}">포함된 배포명</th>
+          <th style="{th_style}">Input Tokens</th>
+          <th style="{th_style}">Output Tokens</th>
+          <th style="{th_style}">Total Tokens</th>
+          <th style="{th_style}">Requests</th>
         </tr>
         {model_rows}
       </table>
 
-      <h4>리전/배포별 사용량</h4>
-      <table class="report-table">
+      <h3 style="margin:24px 0 8px;">리전/배포별 사용량</h3>
+      <table style="{table_style}">
         <tr>
-          <th>리전</th>
-          <th>모델명</th>
-          <th>배포명</th>
-          <th>Total Tokens</th>
-          <th>Requests</th>
+          <th style="{th_style}">리전</th>
+          <th style="{th_style}">모델명</th>
+          <th style="{th_style}">배포명</th>
+          <th style="{th_style}">Input Tokens</th>
+          <th style="{th_style}">Output Tokens</th>
+          <th style="{th_style}">Total Tokens</th>
+          <th style="{th_style}">Requests</th>
         </tr>
         {deployment_rows}
       </table>
@@ -2507,10 +2578,12 @@ def chat_query(req: func.HttpRequest) -> func.HttpResponse:
 
         if is_mail_request(user_message):
             subject = f"[AOAI FinOps Sentinel] 질의형 사용량 리포트 - {report_data['period_kst']}"
+            target_keyword = extract_mail_target_keyword(user_message)
+            target_recipients = resolve_mail_recipients(target_keyword) if target_keyword else None
+
             full_html = f"""
             <html>
-              <body style="font-family:Arial, sans-serif;">
-                <h2>AOAI FinOps Sentinel 질의형 사용량 리포트</h2>
+              <body style="font-family:Arial, sans-serif; color:#111827;">
                 {report_html}
                 <p style="margin-top:24px; color:#6b7280; font-size:12px;">
                   This report was generated by AOAI FinOps Sentinel Chat Agent.
@@ -2518,12 +2591,15 @@ def chat_query(req: func.HttpRequest) -> func.HttpResponse:
               </body>
             </html>
             """
-            mail_result = send_email(subject, full_html)
+            mail_result = send_email(subject, full_html, recipients_override=target_recipients)
             mail_sent = True
 
         final_answer = report_text
         if mail_sent:
-            final_answer += "<br><br>요청하신 리포트를 메일로 발송했습니다."
+            sent_to = ", ".join(mail_result.get("to", [])) if isinstance(mail_result, dict) else ""
+            final_answer += f"<br><br>요청하신 리포트를 메일로 발송했습니다."
+            if sent_to:
+                final_answer += f"<br>수신자: {sent_to}"
 
         return func.HttpResponse(
             json.dumps({
