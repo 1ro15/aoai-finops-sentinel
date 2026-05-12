@@ -2207,10 +2207,9 @@ def parse_chat_date_range(message: str) -> tuple[datetime, datetime, str, str]:
     - 2026년 4월 1일부터 4월 5일까지
     - 4월 1일부터 4월 5일까지
     - 4월1일 부터 5일까지
-    - 4월 1일부터 5일까지
+    - 4월 10일부터 11일까지
     - 4/1부터 4/5까지
     - 5월 1일 사용량 알려줘
-    - 5월 1일 사용량 메일로 보내줘
 
     단일 날짜만 있으면 시작일과 종료일을 같은 날로 처리합니다.
     """
@@ -2230,6 +2229,20 @@ def parse_chat_date_range(message: str) -> tuple[datetime, datetime, str, str]:
         y1, m1, d1 = map(int, full_dates[0])
         y2, m2, d2 = y1, m1, d1
 
+    # 2) "4월1일 부터 5일까지", "4월 10일부터 11일까지"
+    # 중요: 이 패턴은 "4월 10일" 단일 날짜보다 먼저 검사해야 기간 질의가 하루로 오인되지 않음.
+    if m1 is None:
+        inherited_month = re.search(
+            r"(?P<month>\d{1,2})\s*월\s*(?P<start_day>\d{1,2})\s*일?\s*(?:부터|~|-|에서)\s*(?P<end_day>\d{1,2})\s*일?\s*(?:까지)?",
+            text
+        )
+        if inherited_month:
+            y1 = y2 = default_year
+            m1 = m2 = int(inherited_month.group("month"))
+            d1 = int(inherited_month.group("start_day"))
+            d2 = int(inherited_month.group("end_day"))
+
+    # 3) YYYY년 M월 D일 + M월 D일 / M월 D일 2개 / M월 D일 단일
     if m1 is None:
         first_with_year = re.search(r"(20\d{2})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일", text)
         month_day_pairs = re.findall(r"(\d{1,2})\s*월\s*(\d{1,2})\s*일", text)
@@ -2257,20 +2270,8 @@ def parse_chat_date_range(message: str) -> tuple[datetime, datetime, str, str]:
             m1 = m2 = int(month_day_pairs[0][0])
             d1 = d2 = int(month_day_pairs[0][1])
 
+    # 4) 4/1, 4/1부터 4/5까지
     if m1 is None:
-        # "4월1일 부터 5일까지", "4월 1일부터 5일까지"
-        inherited_month = re.search(
-            r"(?P<month>\d{1,2})\s*월\s*(?P<start_day>\d{1,2})\s*일?\s*(?:부터|~|-|에서)\s*(?P<end_day>\d{1,2})\s*일?\s*(?:까지)?",
-            text
-        )
-        if inherited_month:
-            y1 = y2 = default_year
-            m1 = m2 = int(inherited_month.group("month"))
-            d1 = int(inherited_month.group("start_day"))
-            d2 = int(inherited_month.group("end_day"))
-
-    if m1 is None:
-        # 4/1, 4/1부터 4/5까지
         slash_pairs = re.findall(r"(?<!\d)(\d{1,2})/(\d{1,2})(?!\d)", text)
         if len(slash_pairs) >= 2:
             y1 = y2 = default_year
