@@ -2134,3 +2134,70 @@ def monthly_report_timer(mytimer: func.TimerRequest) -> None:
     except Exception:
         logging.exception("monthly_report_timer failed")
         raise
+
+
+# -----------------------------
+# Chat API - Static Web Apps Frontend 테스트용
+# -----------------------------
+@app.route(route="chat_query", methods=["POST"])
+def chat_query(req: func.HttpRequest) -> func.HttpResponse:
+    """
+    Azure Static Web Apps 프론트엔드와 Azure Function 백엔드 연결 테스트용 API입니다.
+
+    현재 단계에서는 실제 사용량 조회/AI 분석은 하지 않고,
+    사용자가 입력한 질문을 받아 정상 응답을 반환합니다.
+
+    다음 단계에서 이 API에 자연어 기간 해석, 사용량 조회, 메일 발송 기능을 연결합니다.
+    """
+    try:
+        try:
+            body = req.get_json()
+        except ValueError:
+            body = {}
+
+        user_message = (
+            body.get("message")
+            or body.get("question")
+            or body.get("text")
+            or ""
+        ).strip()
+
+        if not user_message:
+            return func.HttpResponse(
+                json.dumps({
+                    "status": "error",
+                    "answer": "질문 내용이 비어 있습니다.",
+                    "message": None
+                }, ensure_ascii=False),
+                status_code=400,
+                mimetype="application/json"
+            )
+
+        answer = (
+            "질문을 정상적으로 받았습니다.\n\n"
+            f"입력한 질문: {user_message}\n\n"
+            "현재는 Static Web Apps 프론트엔드와 Azure Function 백엔드 연결 테스트 단계입니다. "
+            "다음 단계에서 이 API에 사용량 조회, 요청 수 조회, 비용 조회, 메일 발송 기능을 연결할 예정입니다."
+        )
+
+        return func.HttpResponse(
+            json.dumps({
+                "status": "ok",
+                "answer": answer,
+                "received_message": user_message
+            }, ensure_ascii=False),
+            status_code=200,
+            mimetype="application/json"
+        )
+
+    except Exception as e:
+        logging.exception("chat_query 처리 중 오류 발생")
+        return func.HttpResponse(
+            json.dumps({
+                "status": "error",
+                "answer": f"chat_query 처리 중 오류가 발생했습니다: {str(e)}"
+            }, ensure_ascii=False),
+            status_code=500,
+            mimetype="application/json"
+        )
+
