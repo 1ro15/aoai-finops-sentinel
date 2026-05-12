@@ -2209,6 +2209,10 @@ def parse_chat_date_range(message: str) -> tuple[datetime, datetime, str, str]:
     - 4월1일 부터 5일까지
     - 4월 1일부터 5일까지
     - 4/1부터 4/5까지
+    - 5월 1일 사용량 알려줘
+    - 5월 1일 사용량 메일로 보내줘
+
+    단일 날짜만 있으면 시작일과 종료일을 같은 날로 처리합니다.
     """
     now_kst = datetime.now(KST)
     default_year = now_kst.year
@@ -2217,10 +2221,14 @@ def parse_chat_date_range(message: str) -> tuple[datetime, datetime, str, str]:
     y1 = y2 = default_year
     m1 = m2 = d1 = d2 = None
 
+    # 1) YYYY-MM-DD / YYYY.MM.DD / YYYY/MM/DD 형식
     full_dates = re.findall(r"(20\d{2})[-./](\d{1,2})[-./](\d{1,2})", text)
     if len(full_dates) >= 2:
         y1, m1, d1 = map(int, full_dates[0])
         y2, m2, d2 = map(int, full_dates[1])
+    elif len(full_dates) == 1:
+        y1, m1, d1 = map(int, full_dates[0])
+        y2, m2, d2 = y1, m1, d1
 
     if m1 is None:
         first_with_year = re.search(r"(20\d{2})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일", text)
@@ -2233,14 +2241,24 @@ def parse_chat_date_range(message: str) -> tuple[datetime, datetime, str, str]:
             y2 = y1
             m2 = int(month_day_pairs[1][0])
             d2 = int(month_day_pairs[1][1])
+        elif first_with_year and len(month_day_pairs) == 1:
+            y1 = int(first_with_year.group(1))
+            m1 = int(month_day_pairs[0][0])
+            d1 = int(month_day_pairs[0][1])
+            y2, m2, d2 = y1, m1, d1
         elif len(month_day_pairs) >= 2:
             y1 = y2 = default_year
             m1 = int(month_day_pairs[0][0])
             d1 = int(month_day_pairs[0][1])
             m2 = int(month_day_pairs[1][0])
             d2 = int(month_day_pairs[1][1])
+        elif len(month_day_pairs) == 1:
+            y1 = y2 = default_year
+            m1 = m2 = int(month_day_pairs[0][0])
+            d1 = d2 = int(month_day_pairs[0][1])
 
     if m1 is None:
+        # "4월1일 부터 5일까지", "4월 1일부터 5일까지"
         inherited_month = re.search(
             r"(?P<month>\d{1,2})\s*월\s*(?P<start_day>\d{1,2})\s*일?\s*(?:부터|~|-|에서)\s*(?P<end_day>\d{1,2})\s*일?\s*(?:까지)?",
             text
@@ -2252,6 +2270,7 @@ def parse_chat_date_range(message: str) -> tuple[datetime, datetime, str, str]:
             d2 = int(inherited_month.group("end_day"))
 
     if m1 is None:
+        # 4/1, 4/1부터 4/5까지
         slash_pairs = re.findall(r"(?<!\d)(\d{1,2})/(\d{1,2})(?!\d)", text)
         if len(slash_pairs) >= 2:
             y1 = y2 = default_year
@@ -2259,10 +2278,15 @@ def parse_chat_date_range(message: str) -> tuple[datetime, datetime, str, str]:
             d1 = int(slash_pairs[0][1])
             m2 = int(slash_pairs[1][0])
             d2 = int(slash_pairs[1][1])
+        elif len(slash_pairs) == 1:
+            y1 = y2 = default_year
+            m1 = m2 = int(slash_pairs[0][0])
+            d1 = d2 = int(slash_pairs[0][1])
 
     if m1 is None:
         raise ValueError(
-            "조회 기간을 찾지 못했습니다. 예: '4월 1일부터 4월 5일까지 사용량 알려줘' 또는 '4월1일 부터 5일까지 사용량 알려줘'처럼 입력해주세요."
+            "조회 기간을 찾지 못했습니다. 예: '4월 1일부터 4월 5일까지 사용량 알려줘', "
+            "'4월1일 부터 5일까지 사용량 알려줘', 또는 '5월 1일 사용량 알려줘'처럼 입력해주세요."
         )
 
     start_kst = datetime(y1, m1, d1, 0, 0, 0, tzinfo=KST)
@@ -2343,6 +2367,138 @@ def build_chat_usage_report_data(message: str) -> dict[str, Any]:
         "metrics": metrics,
         "costs": costs,
     }
+
+
+
+def is_single_day_report(report_data: dict[str, Any]) -> bool:
+    return report_data.get("start_date_kst") == report_data.get("end_date_kst")
+
+
+def build_chat_daily_compare_data(report_data: dict[str, Any]) -> dict[str, Any]:
+    """
+    챗봇에서 단일 날짜를 조회한 경우, 기존 일일 리포트와 동일하게
+    조회일과 전일을 비교하는 데이터 구조를 생성합니다.
+    """
+    current_start = datetime.fromisoformat(report_data["start_time_utc"])
+    current_end = datetime.fromisoformat(report_data["end_time_utc"])
+    previous_start = current_start - timedelta(days=1)
+    previous_end = current_start
+
+    current_date = report_data["start_date_kst"]
+    previous_date = (datetime.fromisoformat(report_data["start_date_kst"]).date() - timedelta(days=1)).isoformat()
+
+    credential = DefaultAzureCredential()
+    resources = load_resources()
+    deployment_model_map = load_deployment_model_map()
+    subscription_id = get_env("SUBSCRIPTION_ID")
+    resource_ids = [resource["resource_id"] for resource in resources]
+
+    previous_metrics = fetch_metrics_for_custom_range(
+        credential=credential,
+        resources=resources,
+        start_time_utc=previous_start,
+        end_time_utc=previous_end,
+        deployment_model_map=deployment_model_map,
+    )
+
+    current_metrics = report_data["metrics"]
+
+    model_breakdown = build_model_breakdown(
+        previous_metrics.get("model_summary", []),
+        current_metrics.get("model_summary", [])
+    )
+
+    deployment_breakdown = build_deployment_breakdown(
+        previous_metrics.get("items", []),
+        current_metrics.get("items", [])
+    )
+
+    cost_error = None
+
+    try:
+        previous_costs = fetch_costs_for_custom_range(
+            credential=credential,
+            subscription_id=subscription_id,
+            resource_ids=resource_ids,
+            start_time_utc=previous_start,
+            end_time_utc=previous_end,
+            period_label=f"{previous_date} ~ {previous_date}",
+            start_kst_str=previous_date,
+            end_kst_str=previous_date,
+        )
+        current_costs = report_data["costs"]
+        cost_change = calculate_change(
+            current_costs.get("total_cost"),
+            previous_costs.get("total_cost")
+        )
+    except Exception as e:
+        logging.exception("Chat daily cost comparison failed")
+        cost_error = str(e)
+
+        previous_costs = {
+            "period_label": f"{previous_date} ~ {previous_date}",
+            "period_kst": f"{previous_date} ~ {previous_date}",
+            "currency": None,
+            "total_cost": None,
+            "daily_rows": [],
+            "resource_costs": [],
+            "cost_data_available": False
+        }
+        current_costs = report_data["costs"]
+        cost_change = {
+            "difference": None,
+            "rate_percent": None
+        }
+
+    token_change = {
+        "prompt_tokens": calculate_change(
+            current_metrics["summary"].get("prompt_tokens"),
+            previous_metrics["summary"].get("prompt_tokens")
+        ),
+        "completion_tokens": calculate_change(
+            current_metrics["summary"].get("completion_tokens"),
+            previous_metrics["summary"].get("completion_tokens")
+        ),
+        "total_tokens": calculate_change(
+            current_metrics["summary"].get("total_tokens"),
+            previous_metrics["summary"].get("total_tokens")
+        ),
+        "request_count": calculate_change(
+            current_metrics["summary"].get("request_count"),
+            previous_metrics["summary"].get("request_count")
+        ),
+    }
+
+    return {
+        "timezone": "KST",
+        "resource_count": len(resources),
+        "deployment_model_map_count": len(deployment_model_map),
+        "cost_error": cost_error,
+        "comparison": {
+            "previous_day": {
+                "date_kst": previous_date,
+                "metrics": previous_metrics,
+                "costs": previous_costs
+            },
+            "current_day": {
+                "date_kst": current_date,
+                "metrics": current_metrics,
+                "costs": current_costs
+            },
+            "summary_change": {
+                "tokens": token_change,
+                "cost": cost_change
+            },
+            "model_breakdown": model_breakdown,
+            "deployment_breakdown": deployment_breakdown
+        }
+    }
+
+
+def build_chat_daily_compare_html(report_text: str, compare_data: dict[str, Any]) -> str:
+    daily_html = build_email_html(report_text, compare_data)
+    # 기존 이메일 HTML은 전체 html/body를 포함하므로, 채팅 화면에 넣을 때도 그대로 사용 가능하다.
+    return daily_html
 
 
 def generate_chat_usage_summary(report_data: dict[str, Any]) -> str:
@@ -2570,14 +2726,30 @@ def chat_query(req: func.HttpRequest) -> func.HttpResponse:
             )
 
         report_data = build_chat_usage_report_data(user_message)
-        report_text = generate_chat_usage_summary(report_data)
-        report_html = build_chat_usage_report_html(report_text, report_data)
+
+        if is_single_day_report(report_data):
+            compare_data = build_chat_daily_compare_data(report_data)
+            report_text = generate_report_text(compare_data)
+            report_html = build_chat_daily_compare_html(report_text, compare_data)
+            subject = f"[AOAI FinOps Sentinel] 질의형 일일 사용량 리포트 - {report_data['start_date_kst']}"
+            response_report_data = {
+                "mode": "single_day_compare",
+                "report_data": response_report_data,
+                "compare_data": compare_data,
+            }
+        else:
+            report_text = generate_chat_usage_summary(report_data)
+            report_html = build_chat_usage_report_html(report_text, report_data)
+            subject = f"[AOAI FinOps Sentinel] 질의형 사용량 리포트 - {report_data['period_kst']}"
+            response_report_data = {
+                "mode": "range_summary",
+                "report_data": response_report_data,
+            }
 
         mail_sent = False
         mail_result = None
 
         if is_mail_request(user_message):
-            subject = f"[AOAI FinOps Sentinel] 질의형 사용량 리포트 - {report_data['period_kst']}"
             target_keyword = extract_mail_target_keyword(user_message)
             target_recipients = resolve_mail_recipients(target_keyword) if target_keyword else None
 
@@ -2608,7 +2780,7 @@ def chat_query(req: func.HttpRequest) -> func.HttpResponse:
                 "answer_html": report_html + ("<p><strong>메일 발송 완료</strong></p>" if mail_sent else ""),
                 "mail_sent": mail_sent,
                 "mail_result": mail_result,
-                "report_data": report_data,
+                "report_data": response_report_data,
             }, ensure_ascii=False, default=str),
             status_code=200,
             mimetype="application/json"
