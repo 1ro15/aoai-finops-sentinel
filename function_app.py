@@ -2734,7 +2734,7 @@ def chat_query(req: func.HttpRequest) -> func.HttpResponse:
             subject = f"[AOAI FinOps Sentinel] 질의형 일일 사용량 리포트 - {report_data['start_date_kst']}"
             response_report_data = {
                 "mode": "single_day_compare",
-                "report_data": response_report_data,
+                "report_data": report_data,
                 "compare_data": compare_data,
             }
         else:
@@ -2743,7 +2743,7 @@ def chat_query(req: func.HttpRequest) -> func.HttpResponse:
             subject = f"[AOAI FinOps Sentinel] 질의형 사용량 리포트 - {report_data['period_kst']}"
             response_report_data = {
                 "mode": "range_summary",
-                "report_data": response_report_data,
+                "report_data": report_data,
             }
 
         mail_sent = False
@@ -2780,7 +2780,7 @@ def chat_query(req: func.HttpRequest) -> func.HttpResponse:
                 "answer_html": report_html + ("<p><strong>메일 발송 완료</strong></p>" if mail_sent else ""),
                 "mail_sent": mail_sent,
                 "mail_result": mail_result,
-                "report_data": response_report_data,
+                "report_data": report_data,
             }, ensure_ascii=False, default=str),
             status_code=200,
             mimetype="application/json"
