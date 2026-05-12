@@ -2,6 +2,8 @@ const chatBox = document.getElementById("chat-box");
 const userInput = document.getElementById("user-input");
 const sendButton = document.getElementById("send-button");
 
+let lastReportQuery = "";
+
 function addMessage(content, sender, isHtml = false) {
   const div = document.createElement("div");
   div.className = `message ${sender}`;
@@ -16,8 +18,25 @@ function addMessage(content, sender, isHtml = false) {
   chatBox.scrollTop = chatBox.scrollHeight;
 }
 
+function isMailOnlyRequest(text) {
+  const lower = text.toLowerCase();
+  const hasMailWord =
+    lower.includes("메일") ||
+    lower.includes("이메일") ||
+    lower.includes("mail") ||
+    lower.includes("email");
+
+  const hasDateHint =
+    text.includes("월") ||
+    text.includes("/") ||
+    text.includes("-") ||
+    /\d{4}/.test(text);
+
+  return hasMailWord && !hasDateHint;
+}
+
 async function sendMessage() {
-  const text = userInput.value.trim();
+  let text = userInput.value.trim();
 
   if (!text) {
     return;
@@ -25,6 +44,18 @@ async function sendMessage() {
 
   addMessage(text, "user");
   userInput.value = "";
+
+  if (isMailOnlyRequest(text)) {
+    if (!lastReportQuery) {
+      addMessage(
+        "메일로 보낼 이전 조회 결과가 없습니다. 먼저 기간을 지정해서 사용량을 조회해주세요.",
+        "bot"
+      );
+      return;
+    }
+
+    text = `${lastReportQuery} 메일로 보내줘`;
+  }
 
   sendButton.disabled = true;
   sendButton.textContent = "조회 중...";
@@ -56,6 +87,10 @@ async function sendMessage() {
       "bot",
       Boolean(data.answer_html)
     );
+
+    if (!isMailOnlyRequest(text) && !text.includes("메일") && !text.includes("이메일")) {
+      lastReportQuery = text;
+    }
 
   } catch (error) {
     console.error(error);

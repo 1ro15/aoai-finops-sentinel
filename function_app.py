@@ -2148,26 +2148,23 @@ def parse_chat_date_range(message: str) -> tuple[datetime, datetime, str, str]:
     - 2026-04-01부터 2026-04-05까지
     - 2026년 4월 1일부터 4월 5일까지
     - 4월 1일부터 4월 5일까지
+    - 4월1일 부터 5일까지
+    - 4월 1일부터 5일까지
     - 4/1부터 4/5까지
-
-    반환:
-    - start_kst: 시작일 00:00 KST
-    - end_kst_exclusive: 종료일 다음날 00:00 KST
-    - start_label: YYYY-MM-DD
-    - end_label: YYYY-MM-DD
     """
     now_kst = datetime.now(KST)
     default_year = now_kst.year
-
     text = message.strip()
 
-    # 1) YYYY-MM-DD / YYYY.MM.DD / YYYY/MM/DD 형식
+    y1 = y2 = default_year
+    m1 = m2 = d1 = d2 = None
+
     full_dates = re.findall(r"(20\d{2})[-./](\d{1,2})[-./](\d{1,2})", text)
     if len(full_dates) >= 2:
         y1, m1, d1 = map(int, full_dates[0])
         y2, m2, d2 = map(int, full_dates[1])
-    else:
-        # 2) YYYY년 M월 D일 + M월 D일 형태
+
+    if m1 is None:
         first_with_year = re.search(r"(20\d{2})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일", text)
         month_day_pairs = re.findall(r"(\d{1,2})\s*월\s*(\d{1,2})\s*일", text)
 
@@ -2184,19 +2181,31 @@ def parse_chat_date_range(message: str) -> tuple[datetime, datetime, str, str]:
             d1 = int(month_day_pairs[0][1])
             m2 = int(month_day_pairs[1][0])
             d2 = int(month_day_pairs[1][1])
-        else:
-            # 3) M/D 형태
-            slash_pairs = re.findall(r"(?<!\d)(\d{1,2})/(\d{1,2})(?!\d)", text)
-            if len(slash_pairs) >= 2:
-                y1 = y2 = default_year
-                m1 = int(slash_pairs[0][0])
-                d1 = int(slash_pairs[0][1])
-                m2 = int(slash_pairs[1][0])
-                d2 = int(slash_pairs[1][1])
-            else:
-                raise ValueError(
-                    "조회 기간을 찾지 못했습니다. 예: '4월 1일부터 4월 5일까지 사용량 알려줘'처럼 입력해주세요."
-                )
+
+    if m1 is None:
+        inherited_month = re.search(
+            r"(?P<month>\d{1,2})\s*월\s*(?P<start_day>\d{1,2})\s*일?\s*(?:부터|~|-|에서)\s*(?P<end_day>\d{1,2})\s*일?\s*(?:까지)?",
+            text
+        )
+        if inherited_month:
+            y1 = y2 = default_year
+            m1 = m2 = int(inherited_month.group("month"))
+            d1 = int(inherited_month.group("start_day"))
+            d2 = int(inherited_month.group("end_day"))
+
+    if m1 is None:
+        slash_pairs = re.findall(r"(?<!\d)(\d{1,2})/(\d{1,2})(?!\d)", text)
+        if len(slash_pairs) >= 2:
+            y1 = y2 = default_year
+            m1 = int(slash_pairs[0][0])
+            d1 = int(slash_pairs[0][1])
+            m2 = int(slash_pairs[1][0])
+            d2 = int(slash_pairs[1][1])
+
+    if m1 is None:
+        raise ValueError(
+            "조회 기간을 찾지 못했습니다. 예: '4월 1일부터 4월 5일까지 사용량 알려줘' 또는 '4월1일 부터 5일까지 사용량 알려줘'처럼 입력해주세요."
+        )
 
     start_kst = datetime(y1, m1, d1, 0, 0, 0, tzinfo=KST)
     end_kst_inclusive = datetime(y2, m2, d2, 0, 0, 0, tzinfo=KST)
@@ -2206,7 +2215,6 @@ def parse_chat_date_range(message: str) -> tuple[datetime, datetime, str, str]:
 
     end_kst_exclusive = end_kst_inclusive + timedelta(days=1)
 
-    # Azure Monitor Metrics는 장기 보관 한계가 있으므로 90일 초과 조회를 차단합니다.
     oldest_allowed = now_kst - timedelta(days=90)
     if start_kst < oldest_allowed:
         raise ValueError(
@@ -2217,7 +2225,6 @@ def parse_chat_date_range(message: str) -> tuple[datetime, datetime, str, str]:
     if (end_kst_exclusive - start_kst).days > 90:
         raise ValueError("한 번에 조회 가능한 기간은 최대 90일입니다. 기간을 나누어 요청해주세요.")
 
-    # 미래 날짜도 차단
     tomorrow_kst = datetime(now_kst.year, now_kst.month, now_kst.day, 0, 0, 0, tzinfo=KST) + timedelta(days=1)
     if start_kst >= tomorrow_kst:
         raise ValueError("미래 날짜는 조회할 수 없습니다.")
@@ -2233,11 +2240,9 @@ def parse_chat_date_range(message: str) -> tuple[datetime, datetime, str, str]:
         end_kst_inclusive.strftime("%Y-%m-%d"),
     )
 
-
 def is_mail_request(message: str) -> bool:
-    keywords = ["메일", "이메일", "mail", "email", "보내줘", "발송"]
+    keywords = ["메일", "이메일", "mail", "email", "보내줘", "발송", "전송"]
     return any(keyword.lower() in message.lower() for keyword in keywords)
-
 
 def build_chat_usage_report_data(message: str) -> dict[str, Any]:
     start_kst, end_kst_exclusive, start_label, end_label = parse_chat_date_range(message)
