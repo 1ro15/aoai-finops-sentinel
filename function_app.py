@@ -538,7 +538,9 @@ def fetch_day_costs(
         }
     }
 
-    retry_delays = [60, 300, 600]
+    if retry_delays is None:
+        retry_delays = [60, 300, 600]
+
     last_response = None
 
     for attempt in range(len(retry_delays) + 1):
@@ -862,7 +864,7 @@ def build_daily_compare_data() -> dict[str, Any]:
         d4_metrics["items"]
     )
 
-    cost_error = None
+    cost_error = report_data.get("cost_error")
 
     try:
         d5_costs = fetch_day_costs(credential, subscription_id, resource_ids, days_ago=5)
@@ -1655,6 +1657,7 @@ def fetch_costs_for_custom_range(
     period_label: str,
     start_kst_str: str,
     end_kst_str: str,
+    retry_delays: list[int] | None = None,
 ) -> dict[str, Any]:
     token = credential.get_token("https://management.azure.com/.default").token
 
@@ -2327,6 +2330,34 @@ def is_mail_request(message: str) -> bool:
     keywords = ["메일", "이메일", "mail", "email", "보내줘", "발송", "전송"]
     return any(keyword.lower() in message.lower() for keyword in keywords)
 
+
+def build_unavailable_chat_costs(
+    period_label: str,
+    start_kst_str: str,
+    end_kst_str: str,
+    start_time_utc: datetime,
+    end_time_utc: datetime,
+    error: Exception | str | None = None,
+) -> dict[str, Any]:
+    """
+    Chat Agent에서는 비용 조회가 실패해도 전체 응답을 실패시키지 않습니다.
+    토큰/요청 수를 우선 제공하고, 비용은 일시적으로 조회 불가 상태로 표시합니다.
+    """
+    error_text = str(error) if error else None
+    return {
+        "period_label": period_label,
+        "period_kst": f"{start_kst_str} ~ {end_kst_str}",
+        "start_time_utc": start_time_utc.isoformat(),
+        "end_time_utc": end_time_utc.isoformat(),
+        "currency": None,
+        "total_cost": None,
+        "daily_rows": [],
+        "resource_costs": [],
+        "cost_data_available": False,
+        "cost_error": error_text,
+    }
+
+
 def build_chat_usage_report_data(message: str) -> dict[str, Any]:
     start_kst, end_kst_exclusive, start_label, end_label = parse_chat_date_range(message)
 
@@ -2347,16 +2378,33 @@ def build_chat_usage_report_data(message: str) -> dict[str, Any]:
     )
 
     resource_ids = [resource["resource_id"] for resource in resources]
-    costs = fetch_costs_for_custom_range(
-        credential=credential,
-        subscription_id=subscription_id,
-        resource_ids=resource_ids,
-        start_time_utc=start_utc,
-        end_time_utc=end_utc,
-        period_label=f"{start_label} ~ {end_label}",
-        start_kst_str=start_label,
-        end_kst_str=end_label,
-    )
+
+    cost_error = None
+    try:
+        # Chat Agent는 사용자가 기다리는 대화형 API이므로 Cost API 429/지연 시 긴 재시도를 하지 않습니다.
+        # 비용 조회가 실패해도 토큰/요청 수 리포트는 정상 반환합니다.
+        costs = fetch_costs_for_custom_range(
+            credential=credential,
+            subscription_id=subscription_id,
+            resource_ids=resource_ids,
+            start_time_utc=start_utc,
+            end_time_utc=end_utc,
+            period_label=f"{start_label} ~ {end_label}",
+            start_kst_str=start_label,
+            end_kst_str=end_label,
+            retry_delays=[],
+        )
+    except Exception as e:
+        logging.warning("Chat cost fetch skipped. period=%s ~ %s error=%s", start_label, end_label, e)
+        cost_error = str(e)
+        costs = build_unavailable_chat_costs(
+            period_label=f"{start_label} ~ {end_label}",
+            start_kst_str=start_label,
+            end_kst_str=end_label,
+            start_time_utc=start_utc,
+            end_time_utc=end_utc,
+            error=e,
+        )
 
     return {
         "query": message,
@@ -2367,6 +2415,7 @@ def build_chat_usage_report_data(message: str) -> dict[str, Any]:
         "end_time_utc": end_utc.isoformat(),
         "metrics": metrics,
         "costs": costs,
+        "cost_error": cost_error,
     }
 
 
@@ -2426,12 +2475,19 @@ def build_chat_daily_compare_data(report_data: dict[str, Any]) -> dict[str, Any]
             period_label=f"{previous_date} ~ {previous_date}",
             start_kst_str=previous_date,
             end_kst_str=previous_date,
+            retry_delays=[],
         )
         current_costs = report_data["costs"]
-        cost_change = calculate_change(
-            current_costs.get("total_cost"),
-            previous_costs.get("total_cost")
-        )
+        if current_costs.get("cost_data_available") is False or previous_costs.get("cost_data_available") is False:
+            cost_change = {
+                "difference": None,
+                "rate_percent": None
+            }
+        else:
+            cost_change = calculate_change(
+                current_costs.get("total_cost"),
+                previous_costs.get("total_cost")
+            )
     except Exception as e:
         logging.exception("Chat daily cost comparison failed")
         cost_error = str(e)
@@ -2517,6 +2573,8 @@ def generate_chat_usage_summary(report_data: dict[str, Any]) -> str:
             "query": report_data["query"],
             "summary": summary,
             "cost_total_text": format_cost_text(costs.get("total_cost"), currency),
+            "cost_available": costs.get("cost_data_available", True),
+            "cost_error": costs.get("cost_error"),
             "top_models": metrics.get("model_summary", [])[:5],
         }
 
@@ -2530,6 +2588,7 @@ def generate_chat_usage_summary(report_data: dict[str, Any]) -> str:
 3. 기간, 총 토큰, 요청 수, 비용을 포함한다.
 4. 모델별 상위 사용량이 있으면 canonical model 기준으로 언급한다.
 5. 비용은 cost_total_text 값을 그대로 사용한다.
+6. cost_available이 false이면 비용은 일시적으로 조회되지 않았다고 안내하고 토큰/요청 수 중심으로 설명한다.
 """
 
         user_prompt = f"""
@@ -2554,13 +2613,18 @@ def generate_chat_usage_summary(report_data: dict[str, Any]) -> str:
         logging.exception("generate_chat_usage_summary failed")
         summary = report_data["metrics"].get("summary", {})
         costs = report_data["costs"]
+        cost_sentence = (
+            f"총 비용은 {format_cost_text(costs.get('total_cost'), costs.get('currency'))}입니다."
+            if costs.get("cost_data_available") is not False
+            else "비용 데이터는 Cost Management API 제한 또는 일시적 오류로 조회되지 않아 토큰/요청 수 기준으로 리포트를 제공합니다."
+        )
         return (
             f"{report_data['period_kst']} 기준 Azure OpenAI 사용량입니다.<br>"
             f"총 토큰은 {format_number(summary.get('total_tokens'))}, "
             f"입력 토큰은 {format_number(summary.get('prompt_tokens'))}, "
             f"출력 토큰은 {format_number(summary.get('completion_tokens'))}, "
             f"요청 수는 {format_number(summary.get('request_count'))}건입니다.<br>"
-            f"총 비용은 {format_cost_text(costs.get('total_cost'), costs.get('currency'))}입니다."
+            f"{cost_sentence}"
         )
 
 
@@ -2809,3 +2873,4 @@ def chat_query(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500,
             mimetype="application/json"
         )
+
