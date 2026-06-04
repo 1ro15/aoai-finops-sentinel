@@ -504,6 +504,7 @@ def fetch_day_costs(
     subscription_id: str,
     resource_ids: list[str],
     days_ago: int,
+    retry_delays: list[int] | None = None,
 ) -> dict[str, Any]:
     start_utc, end_utc, target_date_kst = get_kst_day_range_to_utc(days_ago)
 
@@ -538,7 +539,12 @@ def fetch_day_costs(
         }
     }
 
-    retry_delays = [60, 300, 600]
+    # Daily report는 메일 발송이 우선입니다.
+    # Cost API가 429로 제한되면 긴 대기 대신 짧게 1회만 재시도하고,
+    # 실패 시 build_daily_compare_data()에서 비용 제외 리포트로 전환합니다.
+    if retry_delays is None:
+        retry_delays = [5]
+
     last_response = None
 
     for attempt in range(len(retry_delays) + 1):
@@ -2823,4 +2829,4 @@ def chat_query(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500,
             mimetype="application/json"
         )
-    
+
