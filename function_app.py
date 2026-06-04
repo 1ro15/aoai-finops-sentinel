@@ -499,6 +499,61 @@ def parse_cost_response(data: dict[str, Any], target_ids: list[str], fallback_da
     }
 
 
+
+def normalize_cost_usage_date(value: Any) -> str:
+    """
+    Cost Management API의 UsageDate 값을 YYYY-MM-DD 문자열로 정규화합니다.
+    예: 20260501 -> 2026-05-01
+    """
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if len(text) == 8 and text.isdigit():
+        return f"{text[0:4]}-{text[4:6]}-{text[6:8]}"
+    if len(text) >= 10 and text[4:5] == "-" and text[7:8] == "-":
+        return text[:10]
+    return text
+
+
+def map_cost_usage_date_to_kst_period(
+    usage_date: str,
+    first_usage_date: str,
+    start_kst_str: str,
+    end_kst_str: str,
+) -> str:
+    """
+    Cost Management Daily 결과는 UTC 일자 기준 UsageDate로 내려올 수 있습니다.
+
+    예를 들어 KST 기준 2026-05-01 ~ 2026-05-31 기간은 UTC 기준으로
+    2026-04-30 15:00 ~ 2026-05-31 15:00 이므로 Cost API daily 결과에
+    2026-04-30 행이 포함될 수 있습니다.
+
+    월간/기간 리포트 표시는 사용자가 요청한 KST 기간 기준이어야 하므로,
+    첫 번째 Cost UsageDate를 KST 시작일에 맞추고 이후 날짜는 순서대로 보정합니다.
+    마지막에 UTC 부분일 때문에 범위를 초과하는 행은 KST 종료일에 합산합니다.
+    """
+    try:
+        if not usage_date:
+            return start_kst_str
+
+        start_kst_date = datetime.fromisoformat(start_kst_str).date()
+        end_kst_date = datetime.fromisoformat(end_kst_str).date()
+        first_date = datetime.fromisoformat(first_usage_date).date()
+        current_date = datetime.fromisoformat(usage_date).date()
+
+        offset_days = (current_date - first_date).days
+        mapped_date = start_kst_date + timedelta(days=offset_days)
+
+        if mapped_date < start_kst_date:
+            mapped_date = start_kst_date
+        if mapped_date > end_kst_date:
+            mapped_date = end_kst_date
+
+        return mapped_date.isoformat()
+    except Exception:
+        return usage_date or start_kst_str
+
+
 def fetch_day_costs(
     credential: DefaultAzureCredential,
     subscription_id: str,
@@ -654,31 +709,32 @@ def fetch_current_month_costs(
     total_cost = 0.0
     currency = None
 
-    def normalize_usage_date(value: Any) -> str:
-        text = str(value or "").strip()
-        if not text:
-            return ""
-        if len(text) == 8 and text.isdigit():
-            return f"{text[0:4]}-{text[4:6]}-{text[6:8]}"
-        if len(text) >= 10 and text[4] == "-" and text[7] == "-":
-            return text[:10]
-        return text
-
-    daily_cost_map: dict[str, float] = {}
+    raw_cost_rows: list[dict[str, Any]] = []
 
     for row in rows:
         cost_value = float(row[total_cost_idx]) if total_cost_idx is not None else 0.0
         currency = row[currency_idx] if currency_idx is not None else currency
-        usage_date = normalize_usage_date(row[usage_date_idx]) if usage_date_idx is not None else ""
-
-        if usage_date not in daily_cost_map:
-            daily_cost_map[usage_date] = 0.0
-        daily_cost_map[usage_date] += cost_value
+        usage_date = normalize_cost_usage_date(row[usage_date_idx]) if usage_date_idx is not None else ""
+        raw_cost_rows.append({"usage_date": usage_date, "cost": cost_value, "currency": currency})
         total_cost += cost_value
+
+    usage_dates = sorted({r.get("usage_date") for r in raw_cost_rows if r.get("usage_date")})
+    first_usage_date = usage_dates[0] if usage_dates else start_kst_str
+
+    daily_cost_map: dict[str, float] = {}
+    for row in raw_cost_rows:
+        date_kst = map_cost_usage_date_to_kst_period(
+            usage_date=row.get("usage_date", ""),
+            first_usage_date=first_usage_date,
+            start_kst_str=start_kst_str,
+            end_kst_str=end_kst_str,
+        )
+        daily_cost_map[date_kst] = daily_cost_map.get(date_kst, 0.0) + float(row.get("cost", 0.0) or 0.0)
 
     daily_rows = [
         {
             "date": date_key,
+            "date_kst": date_key,
             "cost": cost_value,
             "currency": currency
         }
@@ -1715,10 +1771,10 @@ def fetch_costs_for_custom_range(
             resource_id_idx = find_column_index(columns, "ResourceId")
             total_cost_idx = find_column_index(columns, "totalCost", "PreTaxCost")
             currency_idx = find_column_index(columns, "Currency")
-            usage_date_idx = find_column_index(columns, "UsageDate")
+            usage_date_idx = find_column_index(columns, "UsageDate", "BillingMonth", "Date")
 
             normalized_resource_ids = {x.lower(): x for x in resource_ids}
-            daily_rows = []
+            raw_daily_rows: list[dict[str, Any]] = []
             total_cost = 0.0
             currency = None
 
@@ -1729,9 +1785,9 @@ def fetch_costs_for_custom_range(
 
                 cost_value = float(row[total_cost_idx]) if total_cost_idx is not None else 0.0
                 currency = row[currency_idx] if currency_idx is not None else currency
-                usage_date = str(row[usage_date_idx]) if usage_date_idx is not None else ""
+                usage_date = normalize_cost_usage_date(row[usage_date_idx]) if usage_date_idx is not None else ""
 
-                daily_rows.append({
+                raw_daily_rows.append({
                     "usage_date": usage_date,
                     "resource_id": normalized_resource_ids.get(row_resource_id, row_resource_id),
                     "cost": cost_value,
@@ -1739,7 +1795,24 @@ def fetch_costs_for_custom_range(
                 })
                 total_cost += cost_value
 
-            daily_rows.sort(key=lambda x: (x["usage_date"], x["resource_id"]))
+            usage_dates = sorted({r.get("usage_date") for r in raw_daily_rows if r.get("usage_date")})
+            first_usage_date = usage_dates[0] if usage_dates else start_kst_str
+
+            daily_rows: list[dict[str, Any]] = []
+            for row in raw_daily_rows:
+                date_kst = map_cost_usage_date_to_kst_period(
+                    usage_date=row.get("usage_date", ""),
+                    first_usage_date=first_usage_date,
+                    start_kst_str=start_kst_str,
+                    end_kst_str=end_kst_str,
+                )
+                daily_rows.append({
+                    **row,
+                    "date_kst": date_kst,
+                })
+
+            daily_rows.sort(key=lambda x: (x.get("date_kst") or "", x.get("resource_id") or ""))
+
             resource_totals: dict[str, float] = {}
             for row in daily_rows:
                 rid = row["resource_id"]
@@ -1760,6 +1833,7 @@ def fetch_costs_for_custom_range(
                 "daily_rows": daily_rows,
                 "resource_costs": resource_costs,
                 "cost_data_available": True,
+                "cost_date_basis": "KST display adjusted from Cost Management UTC daily UsageDate",
             }
 
         last_response = response
@@ -1778,7 +1852,6 @@ def fetch_costs_for_custom_range(
     raise RuntimeError(
         f"월간 Cost API 호출 실패: {last_response.status_code} / {last_response.text}"
     )
-
 
 def build_monthly_report_data() -> dict[str, Any]:
     resources = load_resources()
