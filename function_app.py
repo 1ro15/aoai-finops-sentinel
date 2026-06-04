@@ -538,9 +538,7 @@ def fetch_day_costs(
         }
     }
 
-    if retry_delays is None:
-        retry_delays = [60, 300, 600]
-
+    retry_delays = [60, 300, 600]
     last_response = None
 
     for attempt in range(len(retry_delays) + 1):
@@ -864,7 +862,7 @@ def build_daily_compare_data() -> dict[str, Any]:
         d4_metrics["items"]
     )
 
-    cost_error = report_data.get("cost_error")
+    cost_error = None
 
     try:
         d5_costs = fetch_day_costs(credential, subscription_id, resource_ids, days_ago=5)
@@ -1586,8 +1584,10 @@ def daily_report_timer(mytimer: func.TimerRequest) -> None:
             "daily_report_timer success: %s",
             json.dumps(
                 {
-                    "subject": result["send_result"]["subject"],
-                    "recipients": result["send_result"]["recipients"]
+                    "message": result.get("message"),
+                    "to": result.get("send_result", {}).get("to"),
+                    "smtp_host": result.get("send_result", {}).get("smtp_host"),
+                    "smtp_port": result.get("send_result", {}).get("smtp_port"),
                 },
                 ensure_ascii=False
             )
@@ -1657,7 +1657,6 @@ def fetch_costs_for_custom_range(
     period_label: str,
     start_kst_str: str,
     end_kst_str: str,
-    retry_delays: list[int] | None = None,
 ) -> dict[str, Any]:
     token = credential.get_token("https://management.azure.com/.default").token
 
@@ -2337,13 +2336,15 @@ def build_unavailable_chat_costs(
     end_kst_str: str,
     start_time_utc: datetime,
     end_time_utc: datetime,
-    error: Exception | str | None = None,
+    reason: str = "Chat Agent에서는 응답 지연 방지를 위해 비용 조회를 생략했습니다.",
 ) -> dict[str, Any]:
     """
-    Chat Agent에서는 비용 조회가 실패해도 전체 응답을 실패시키지 않습니다.
-    토큰/요청 수를 우선 제공하고, 비용은 일시적으로 조회 불가 상태로 표시합니다.
+    Chat Agent 전용 비용 fallback입니다.
+
+    챗봇은 사용자가 실시간으로 응답을 기다리는 API이므로
+    Cost Management API 429/지연으로 전체 리포트가 실패하지 않도록
+    토큰/요청 수를 우선 제공하고 비용은 일시적으로 조회 불가로 표시합니다.
     """
-    error_text = str(error) if error else None
     return {
         "period_label": period_label,
         "period_kst": f"{start_kst_str} ~ {end_kst_str}",
@@ -2354,7 +2355,7 @@ def build_unavailable_chat_costs(
         "daily_rows": [],
         "resource_costs": [],
         "cost_data_available": False,
-        "cost_error": error_text,
+        "cost_error": reason,
     }
 
 
@@ -2367,7 +2368,6 @@ def build_chat_usage_report_data(message: str) -> dict[str, Any]:
     credential = DefaultAzureCredential()
     resources = load_resources()
     deployment_model_map = load_deployment_model_map()
-    subscription_id = get_env("SUBSCRIPTION_ID")
 
     metrics = fetch_metrics_for_custom_range(
         credential=credential,
@@ -2377,34 +2377,17 @@ def build_chat_usage_report_data(message: str) -> dict[str, Any]:
         deployment_model_map=deployment_model_map,
     )
 
-    resource_ids = [resource["resource_id"] for resource in resources]
-
-    cost_error = None
-    try:
-        # Chat Agent는 사용자가 기다리는 대화형 API이므로 Cost API 429/지연 시 긴 재시도를 하지 않습니다.
-        # 비용 조회가 실패해도 토큰/요청 수 리포트는 정상 반환합니다.
-        costs = fetch_costs_for_custom_range(
-            credential=credential,
-            subscription_id=subscription_id,
-            resource_ids=resource_ids,
-            start_time_utc=start_utc,
-            end_time_utc=end_utc,
-            period_label=f"{start_label} ~ {end_label}",
-            start_kst_str=start_label,
-            end_kst_str=end_label,
-            retry_delays=[],
-        )
-    except Exception as e:
-        logging.warning("Chat cost fetch skipped. period=%s ~ %s error=%s", start_label, end_label, e)
-        cost_error = str(e)
-        costs = build_unavailable_chat_costs(
-            period_label=f"{start_label} ~ {end_label}",
-            start_kst_str=start_label,
-            end_kst_str=end_label,
-            start_time_utc=start_utc,
-            end_time_utc=end_utc,
-            error=e,
-        )
+    # 중요:
+    # Chat Agent에서는 Cost Management API를 호출하지 않습니다.
+    # Cost API가 429/지연 상태일 때 대화형 API가 60초 이상 대기하다 실패하는 것을 방지합니다.
+    # 챗봇은 토큰/요청 수 중심으로 우선 응답하고, 비용은 정기 일일/월간 리포트에서 제공합니다.
+    costs = build_unavailable_chat_costs(
+        period_label=f"{start_label} ~ {end_label}",
+        start_kst_str=start_label,
+        end_kst_str=end_label,
+        start_time_utc=start_utc,
+        end_time_utc=end_utc,
+    )
 
     return {
         "query": message,
@@ -2415,10 +2398,8 @@ def build_chat_usage_report_data(message: str) -> dict[str, Any]:
         "end_time_utc": end_utc.isoformat(),
         "metrics": metrics,
         "costs": costs,
-        "cost_error": cost_error,
+        "cost_error": costs.get("cost_error"),
     }
-
-
 
 def is_single_day_report(report_data: dict[str, Any]) -> bool:
     return report_data.get("start_date_kst") == report_data.get("end_date_kst")
@@ -2428,9 +2409,11 @@ def build_chat_daily_compare_data(report_data: dict[str, Any]) -> dict[str, Any]
     """
     챗봇에서 단일 날짜를 조회한 경우, 기존 일일 리포트와 동일하게
     조회일과 전일을 비교하는 데이터 구조를 생성합니다.
+
+    단, Chat Agent에서는 Cost Management API를 호출하지 않습니다.
+    비용은 정기 일일/월간 리포트에서 처리하고, 챗봇은 토큰/요청 수 중심으로 응답합니다.
     """
     current_start = datetime.fromisoformat(report_data["start_time_utc"])
-    current_end = datetime.fromisoformat(report_data["end_time_utc"])
     previous_start = current_start - timedelta(days=1)
     previous_end = current_start
 
@@ -2440,8 +2423,6 @@ def build_chat_daily_compare_data(report_data: dict[str, Any]) -> dict[str, Any]
     credential = DefaultAzureCredential()
     resources = load_resources()
     deployment_model_map = load_deployment_model_map()
-    subscription_id = get_env("SUBSCRIPTION_ID")
-    resource_ids = [resource["resource_id"] for resource in resources]
 
     previous_metrics = fetch_metrics_for_custom_range(
         credential=credential,
@@ -2463,49 +2444,19 @@ def build_chat_daily_compare_data(report_data: dict[str, Any]) -> dict[str, Any]
         current_metrics.get("items", [])
     )
 
-    cost_error = None
+    previous_costs = build_unavailable_chat_costs(
+        period_label=f"{previous_date} ~ {previous_date}",
+        start_kst_str=previous_date,
+        end_kst_str=previous_date,
+        start_time_utc=previous_start,
+        end_time_utc=previous_end,
+    )
+    current_costs = report_data["costs"]
 
-    try:
-        previous_costs = fetch_costs_for_custom_range(
-            credential=credential,
-            subscription_id=subscription_id,
-            resource_ids=resource_ids,
-            start_time_utc=previous_start,
-            end_time_utc=previous_end,
-            period_label=f"{previous_date} ~ {previous_date}",
-            start_kst_str=previous_date,
-            end_kst_str=previous_date,
-            retry_delays=[],
-        )
-        current_costs = report_data["costs"]
-        if current_costs.get("cost_data_available") is False or previous_costs.get("cost_data_available") is False:
-            cost_change = {
-                "difference": None,
-                "rate_percent": None
-            }
-        else:
-            cost_change = calculate_change(
-                current_costs.get("total_cost"),
-                previous_costs.get("total_cost")
-            )
-    except Exception as e:
-        logging.exception("Chat daily cost comparison failed")
-        cost_error = str(e)
-
-        previous_costs = {
-            "period_label": f"{previous_date} ~ {previous_date}",
-            "period_kst": f"{previous_date} ~ {previous_date}",
-            "currency": None,
-            "total_cost": None,
-            "daily_rows": [],
-            "resource_costs": [],
-            "cost_data_available": False
-        }
-        current_costs = report_data["costs"]
-        cost_change = {
-            "difference": None,
-            "rate_percent": None
-        }
+    cost_change = {
+        "difference": None,
+        "rate_percent": None
+    }
 
     token_change = {
         "prompt_tokens": calculate_change(
@@ -2530,7 +2481,7 @@ def build_chat_daily_compare_data(report_data: dict[str, Any]) -> dict[str, Any]
         "timezone": "KST",
         "resource_count": len(resources),
         "deployment_model_map_count": len(deployment_model_map),
-        "cost_error": cost_error,
+        "cost_error": "Chat Agent에서는 응답 지연 방지를 위해 비용 조회를 생략했습니다.",
         "comparison": {
             "previous_day": {
                 "date_kst": previous_date,
@@ -2550,7 +2501,6 @@ def build_chat_daily_compare_data(report_data: dict[str, Any]) -> dict[str, Any]
             "deployment_breakdown": deployment_breakdown
         }
     }
-
 
 def build_chat_daily_compare_html(report_text: str, compare_data: dict[str, Any]) -> str:
     daily_html = build_email_html(report_text, compare_data)
@@ -2588,7 +2538,7 @@ def generate_chat_usage_summary(report_data: dict[str, Any]) -> str:
 3. 기간, 총 토큰, 요청 수, 비용을 포함한다.
 4. 모델별 상위 사용량이 있으면 canonical model 기준으로 언급한다.
 5. 비용은 cost_total_text 값을 그대로 사용한다.
-6. cost_available이 false이면 비용은 일시적으로 조회되지 않았다고 안내하고 토큰/요청 수 중심으로 설명한다.
+6. cost_available이 false이면 비용은 챗봇 조회에서 생략되었다고 안내하고 토큰/요청 수 중심으로 설명한다.
 """
 
         user_prompt = f"""
@@ -2616,7 +2566,7 @@ def generate_chat_usage_summary(report_data: dict[str, Any]) -> str:
         cost_sentence = (
             f"총 비용은 {format_cost_text(costs.get('total_cost'), costs.get('currency'))}입니다."
             if costs.get("cost_data_available") is not False
-            else "비용 데이터는 Cost Management API 제한 또는 일시적 오류로 조회되지 않아 토큰/요청 수 기준으로 리포트를 제공합니다."
+            else "비용 데이터는 응답 지연 방지를 위해 챗봇 조회에서 생략되었습니다. 토큰/요청 수 기준으로 리포트를 제공합니다."
         )
         return (
             f"{report_data['period_kst']} 기준 Azure OpenAI 사용량입니다.<br>"
@@ -2873,4 +2823,4 @@ def chat_query(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500,
             mimetype="application/json"
         )
-
+    
