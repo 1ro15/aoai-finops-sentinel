@@ -1095,8 +1095,8 @@ def generate_report_text(compare_data: dict[str, Any]) -> str:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
         ],
-        temperature=0.1,
-        max_tokens=500
+        reasoning_effort="none",
+        max_completion_tokens=500
     )
 
     return add_line_breaks(response.choices[0].message.content.strip())
@@ -1977,8 +1977,8 @@ def generate_monthly_report_text(monthly_data: dict[str, Any]) -> str:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt}
         ],
-        temperature=0.1,
-        max_tokens=500
+        reasoning_effort="none",
+        max_completion_tokens=500
     )
 
     return add_line_breaks(response.choices[0].message.content.strip())
@@ -2633,8 +2633,8 @@ def generate_chat_usage_summary(report_data: dict[str, Any]) -> str:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=0.1,
-            max_tokens=500,
+            reasoning_effort="none",
+            max_completion_tokens=500,
         )
         return add_line_breaks(response.choices[0].message.content.strip())
 
