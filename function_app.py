@@ -2284,7 +2284,17 @@ def monthly_report_timer(mytimer: func.TimerRequest) -> None:
 # -----------------------------
 # Chat API - Static Web Apps Frontend 질의형 리포트 API
 # -----------------------------
-def parse_chat_date_range(message: str) -> tuple[datetime, datetime, str, str]:
+def _get_month_bounds_kst(year: int, month: int) -> tuple[datetime, datetime]:
+    """지정 월의 KST 기준 첫날/마지막 날(00:00)을 반환합니다."""
+    start = datetime(year, month, 1, 0, 0, 0, tzinfo=KST)
+    if month == 12:
+        next_month = datetime(year + 1, 1, 1, 0, 0, 0, tzinfo=KST)
+    else:
+        next_month = datetime(year, month + 1, 1, 0, 0, 0, tzinfo=KST)
+    return start, next_month - timedelta(days=1)
+
+
+def parse_chat_date_range(message: str) -> tuple[datetime, datetime, str, str, dict[str, Any]]:
     """
     사용자의 한국어/숫자형 날짜 표현을 KST 기준 시작/종료 일자로 변환합니다.
 
@@ -2296,24 +2306,68 @@ def parse_chat_date_range(message: str) -> tuple[datetime, datetime, str, str]:
     - 4월 10일부터 11일까지
     - 4/1부터 4/5까지
     - 5월 1일 사용량 알려줘
+    - 8월 사용량 알려줘
+    - 2026년 8월 사용량 알려줘
+    - 이번 달 사용량 알려줘 / 지난달 사용량 알려줘
+    - 오늘 사용량 알려줘 / 어제 사용량 알려줘
 
-    단일 날짜만 있으면 시작일과 종료일을 같은 날로 처리합니다.
+    미래 날짜가 종료일에 포함되면 현재 KST 날짜까지만 조회하고,
+    date_context에 원래 요청 범위와 보정 사유를 함께 기록합니다.
     """
     now_kst = datetime.now(KST)
+    today_kst = datetime(now_kst.year, now_kst.month, now_kst.day, 0, 0, 0, tzinfo=KST)
+    tomorrow_kst = today_kst + timedelta(days=1)
     default_year = now_kst.year
     text = message.strip()
+    normalized_text = re.sub(r"\s+", " ", text)
 
     y1 = y2 = default_year
     m1 = m2 = d1 = d2 = None
+    expression_type = "explicit_date"
+    interpretation = "사용자가 지정한 날짜 범위로 해석했습니다."
+
+    # 0) 상대 날짜: 오늘 / 어제
+    if re.search(r"(?:^|\s)오늘(?:\s|$|사용량|비용|토큰|요청)", normalized_text):
+        y1 = y2 = today_kst.year
+        m1 = m2 = today_kst.month
+        d1 = d2 = today_kst.day
+        expression_type = "today"
+        interpretation = f"'오늘'을 KST 기준 {today_kst.strftime('%Y-%m-%d')}로 해석했습니다."
+    elif re.search(r"(?:^|\s)어제(?:\s|$|사용량|비용|토큰|요청)", normalized_text):
+        yesterday = today_kst - timedelta(days=1)
+        y1 = y2 = yesterday.year
+        m1 = m2 = yesterday.month
+        d1 = d2 = yesterday.day
+        expression_type = "yesterday"
+        interpretation = f"'어제'를 KST 기준 {yesterday.strftime('%Y-%m-%d')}로 해석했습니다."
+
+    # 0-1) 상대 월: 이번 달 / 지난달
+    if m1 is None and re.search(r"이번\s*달|금월", normalized_text):
+        month_start, month_end = _get_month_bounds_kst(today_kst.year, today_kst.month)
+        y1, m1, d1 = month_start.year, month_start.month, month_start.day
+        y2, m2, d2 = month_end.year, month_end.month, month_end.day
+        expression_type = "this_month"
+        interpretation = f"'이번 달'을 {today_kst.year}년 {today_kst.month}월 전체 기간으로 해석했습니다."
+    elif m1 is None and re.search(r"지난\s*달|전월", normalized_text):
+        this_month_start = datetime(today_kst.year, today_kst.month, 1, tzinfo=KST)
+        previous_month_end = this_month_start - timedelta(days=1)
+        month_start, month_end = _get_month_bounds_kst(previous_month_end.year, previous_month_end.month)
+        y1, m1, d1 = month_start.year, month_start.month, month_start.day
+        y2, m2, d2 = month_end.year, month_end.month, month_end.day
+        expression_type = "previous_month"
+        interpretation = f"'지난달'을 {month_start.year}년 {month_start.month}월 전체 기간으로 해석했습니다."
 
     # 1) YYYY-MM-DD / YYYY.MM.DD / YYYY/MM/DD 형식
-    full_dates = re.findall(r"(20\d{2})[-./](\d{1,2})[-./](\d{1,2})", text)
-    if len(full_dates) >= 2:
-        y1, m1, d1 = map(int, full_dates[0])
-        y2, m2, d2 = map(int, full_dates[1])
-    elif len(full_dates) == 1:
-        y1, m1, d1 = map(int, full_dates[0])
-        y2, m2, d2 = y1, m1, d1
+    if m1 is None:
+        full_dates = re.findall(r"(20\d{2})[-./](\d{1,2})[-./](\d{1,2})", text)
+        if len(full_dates) >= 2:
+            y1, m1, d1 = map(int, full_dates[0])
+            y2, m2, d2 = map(int, full_dates[1])
+            expression_type = "explicit_range"
+        elif len(full_dates) == 1:
+            y1, m1, d1 = map(int, full_dates[0])
+            y2, m2, d2 = y1, m1, d1
+            expression_type = "single_day"
 
     # 2) "4월1일 부터 5일까지", "4월 10일부터 11일까지"
     # 중요: 이 패턴은 "4월 10일" 단일 날짜보다 먼저 검사해야 기간 질의가 하루로 오인되지 않음.
@@ -2327,6 +2381,7 @@ def parse_chat_date_range(message: str) -> tuple[datetime, datetime, str, str]:
             m1 = m2 = int(inherited_month.group("month"))
             d1 = int(inherited_month.group("start_day"))
             d2 = int(inherited_month.group("end_day"))
+            expression_type = "explicit_range"
 
     # 3) YYYY년 M월 D일 + M월 D일 / M월 D일 2개 / M월 D일 단일
     if m1 is None:
@@ -2340,21 +2395,25 @@ def parse_chat_date_range(message: str) -> tuple[datetime, datetime, str, str]:
             y2 = y1
             m2 = int(month_day_pairs[1][0])
             d2 = int(month_day_pairs[1][1])
+            expression_type = "explicit_range"
         elif first_with_year and len(month_day_pairs) == 1:
             y1 = int(first_with_year.group(1))
             m1 = int(month_day_pairs[0][0])
             d1 = int(month_day_pairs[0][1])
             y2, m2, d2 = y1, m1, d1
+            expression_type = "single_day"
         elif len(month_day_pairs) >= 2:
             y1 = y2 = default_year
             m1 = int(month_day_pairs[0][0])
             d1 = int(month_day_pairs[0][1])
             m2 = int(month_day_pairs[1][0])
             d2 = int(month_day_pairs[1][1])
+            expression_type = "explicit_range"
         elif len(month_day_pairs) == 1:
             y1 = y2 = default_year
             m1 = m2 = int(month_day_pairs[0][0])
             d1 = d2 = int(month_day_pairs[0][1])
+            expression_type = "single_day"
 
     # 4) 4/1, 4/1부터 4/5까지
     if m1 is None:
@@ -2365,53 +2424,112 @@ def parse_chat_date_range(message: str) -> tuple[datetime, datetime, str, str]:
             d1 = int(slash_pairs[0][1])
             m2 = int(slash_pairs[1][0])
             d2 = int(slash_pairs[1][1])
+            expression_type = "explicit_range"
         elif len(slash_pairs) == 1:
             y1 = y2 = default_year
             m1 = m2 = int(slash_pairs[0][0])
             d1 = d2 = int(slash_pairs[0][1])
+            expression_type = "single_day"
+
+    # 5) "8월 사용량 알려줘", "2026년 8월 사용량 알려줘"와 같은 월 단위 질의
+    if m1 is None:
+        month_only = re.search(r"(?:(20\d{2})\s*년\s*)?(\d{1,2})\s*월", text)
+        if month_only:
+            target_year = int(month_only.group(1)) if month_only.group(1) else default_year
+            target_month = int(month_only.group(2))
+            month_start, month_end = _get_month_bounds_kst(target_year, target_month)
+            y1, m1, d1 = month_start.year, month_start.month, month_start.day
+            y2, m2, d2 = month_end.year, month_end.month, month_end.day
+            expression_type = "month"
+            interpretation = f"'{target_year}년 {target_month}월' 전체 사용량 조회 요청으로 해석했습니다."
 
     if m1 is None:
         raise ValueError(
-            "조회 기간을 찾지 못했습니다. 예: '4월 1일부터 4월 5일까지 사용량 알려줘', "
-            "'4월1일 부터 5일까지 사용량 알려줘', 또는 '5월 1일 사용량 알려줘'처럼 입력해주세요."
+            "조회 기간을 찾지 못했습니다. 예: '8월 사용량 알려줘', '이번 달 사용량 알려줘', "
+            "'4월 1일부터 4월 5일까지 사용량 알려줘', 또는 '5월 1일 사용량 알려줘'처럼 입력해주세요."
         )
 
-    start_kst = datetime(y1, m1, d1, 0, 0, 0, tzinfo=KST)
-    end_kst_inclusive = datetime(y2, m2, d2, 0, 0, 0, tzinfo=KST)
+    try:
+        requested_start_kst = datetime(y1, m1, d1, 0, 0, 0, tzinfo=KST)
+        requested_end_kst = datetime(y2, m2, d2, 0, 0, 0, tzinfo=KST)
+    except ValueError as e:
+        raise ValueError(f"유효하지 않은 날짜가 포함되어 있습니다: {e}") from e
 
-    if end_kst_inclusive < start_kst:
+    if requested_end_kst < requested_start_kst:
         raise ValueError("종료일이 시작일보다 빠릅니다. 조회 기간을 다시 확인해주세요.")
 
-    end_kst_exclusive = end_kst_inclusive + timedelta(days=1)
-
-    oldest_allowed = now_kst - timedelta(days=90)
-    if start_kst < oldest_allowed:
+    if requested_start_kst >= tomorrow_kst:
         raise ValueError(
-            f"Azure Monitor 메트릭은 최근 90일 이내 기간만 조회하도록 제한했습니다. "
-            f"조회 시작일({start_kst.strftime('%Y-%m-%d')})을 최근 90일 이내로 지정해주세요."
+            f"미래 날짜는 조회할 수 없습니다. 현재 KST 날짜는 {today_kst.strftime('%Y-%m-%d')}입니다."
         )
 
-    if (end_kst_exclusive - start_kst).days > 90:
+    # 미래 종료일은 오늘까지만 자동 보정합니다.
+    actual_start_kst = requested_start_kst
+    actual_end_kst = min(requested_end_kst, today_kst)
+
+    oldest_allowed = today_kst - timedelta(days=90)
+    if actual_start_kst < oldest_allowed:
+        raise ValueError(
+            f"Azure Monitor 메트릭은 최근 90일 이내 기간만 조회하도록 제한했습니다. "
+            f"조회 시작일({actual_start_kst.strftime('%Y-%m-%d')})을 최근 90일 이내로 지정해주세요."
+        )
+
+    if (actual_end_kst - actual_start_kst).days + 1 > 90:
         raise ValueError("한 번에 조회 가능한 기간은 최대 90일입니다. 기간을 나누어 요청해주세요.")
 
-    tomorrow_kst = datetime(now_kst.year, now_kst.month, now_kst.day, 0, 0, 0, tzinfo=KST) + timedelta(days=1)
-    if start_kst >= tomorrow_kst:
-        raise ValueError("미래 날짜는 조회할 수 없습니다.")
+    end_kst_exclusive = actual_end_kst + timedelta(days=1)
+    period_adjusted = actual_end_kst != requested_end_kst
 
-    if end_kst_exclusive > tomorrow_kst:
-        end_kst_exclusive = tomorrow_kst
-        end_kst_inclusive = tomorrow_kst - timedelta(days=1)
+    if expression_type == "single_day":
+        interpretation = f"요청하신 날짜를 KST 기준 {actual_start_kst.strftime('%Y-%m-%d')} 단일 일자로 해석했습니다."
+    elif expression_type == "explicit_range":
+        interpretation = (
+            f"요청하신 기간을 KST 기준 {requested_start_kst.strftime('%Y-%m-%d')}부터 "
+            f"{requested_end_kst.strftime('%Y-%m-%d')}까지로 해석했습니다."
+        )
+
+    adjustment_reason = None
+    if period_adjusted:
+        adjustment_reason = (
+            f"요청 종료일({requested_end_kst.strftime('%Y-%m-%d')})이 현재 KST 날짜"
+            f"({today_kst.strftime('%Y-%m-%d')}) 이후이므로 실제 조회는 "
+            f"{actual_start_kst.strftime('%Y-%m-%d')}부터 {actual_end_kst.strftime('%Y-%m-%d')}까지만 수행했습니다."
+        )
+
+    date_context = {
+        "expression_type": expression_type,
+        "interpretation": interpretation,
+        "today_kst": today_kst.strftime("%Y-%m-%d"),
+        "requested_start_date_kst": requested_start_kst.strftime("%Y-%m-%d"),
+        "requested_end_date_kst": requested_end_kst.strftime("%Y-%m-%d"),
+        "actual_start_date_kst": actual_start_kst.strftime("%Y-%m-%d"),
+        "actual_end_date_kst": actual_end_kst.strftime("%Y-%m-%d"),
+        "period_adjusted": period_adjusted,
+        "adjustment_reason": adjustment_reason,
+    }
 
     return (
-        start_kst,
+        actual_start_kst,
         end_kst_exclusive,
-        start_kst.strftime("%Y-%m-%d"),
-        end_kst_inclusive.strftime("%Y-%m-%d"),
+        actual_start_kst.strftime("%Y-%m-%d"),
+        actual_end_kst.strftime("%Y-%m-%d"),
+        date_context,
     )
 
 def is_mail_request(message: str) -> bool:
     keywords = ["메일", "이메일", "mail", "email", "보내줘", "발송", "전송"]
     return any(keyword.lower() in message.lower() for keyword in keywords)
+
+
+def _chat_cost_error_message(error: Exception) -> str:
+    """Cost API 예외를 사용자에게 노출하기 적절한 짧은 문장으로 변환합니다."""
+    raw = str(error)
+    lowered = raw.lower()
+    if "429" in raw or "too many requests" in lowered:
+        return "Cost Management API 요청 제한(429)으로 이번 비용 조회를 완료하지 못했습니다. 잠시 후 다시 조회하면 비용이 표시될 수 있습니다."
+    if "timeout" in lowered or "timed out" in lowered:
+        return "Cost Management API 응답 시간이 초과되어 이번 비용 조회를 완료하지 못했습니다. 잠시 후 다시 조회해주세요."
+    return "Cost Management API에서 비용을 일시적으로 조회하지 못했습니다. 토큰과 요청 수 데이터는 정상적으로 조회했습니다."
 
 
 def build_unavailable_chat_costs(
@@ -2442,9 +2560,83 @@ def build_unavailable_chat_costs(
         "cost_error": reason,
     }
 
+def build_chat_analysis_context(metrics: dict[str, Any]) -> dict[str, Any]:
+    """LLM이 숫자를 재계산하지 않아도 되도록 핵심 사용 패턴을 Python에서 미리 계산합니다."""
+    summary = metrics.get("summary", {}) or {}
+    total_tokens = float(summary.get("total_tokens", 0) or 0)
+    request_count = float(summary.get("request_count", 0) or 0)
+
+    average_tokens_per_request = None
+    if request_count > 0:
+        average_tokens_per_request = total_tokens / request_count
+
+    model_summary = metrics.get("model_summary", []) or []
+    top_model = model_summary[0] if model_summary else None
+    top_model_context = None
+    if top_model:
+        model_tokens = float(top_model.get("total_tokens", 0) or 0)
+        top_model_context = {
+            "model_name": top_model.get("model_name"),
+            "total_tokens": model_tokens,
+            "request_count": top_model.get("request_count", 0),
+            "regions": top_model.get("regions", []),
+            "deployments": top_model.get("deployments", []),
+            "token_share_percent": (model_tokens / total_tokens * 100) if total_tokens > 0 else None,
+        }
+
+    region_map: dict[str, dict[str, float]] = {}
+    for item in metrics.get("items", []) or []:
+        region = item.get("region", "unknown")
+        if region not in region_map:
+            region_map[region] = {"total_tokens": 0.0, "request_count": 0.0}
+        region_map[region]["total_tokens"] += float(item.get("total_tokens", 0) or 0)
+        region_map[region]["request_count"] += float(item.get("request_count", 0) or 0)
+
+    top_region_context = None
+    if region_map:
+        top_region_name, top_region_values = max(
+            region_map.items(),
+            key=lambda x: (x[1]["total_tokens"], x[1]["request_count"]),
+        )
+        top_region_context = {
+            "region": top_region_name,
+            "total_tokens": top_region_values["total_tokens"],
+            "request_count": top_region_values["request_count"],
+            "token_share_percent": (
+                top_region_values["total_tokens"] / total_tokens * 100
+                if total_tokens > 0 else None
+            ),
+        }
+
+    deployment_items = metrics.get("items", []) or []
+    top_deployment_context = None
+    if deployment_items:
+        top_deployment = max(
+            deployment_items,
+            key=lambda x: (float(x.get("total_tokens", 0) or 0), float(x.get("request_count", 0) or 0)),
+        )
+        top_deployment_context = {
+            "deployment_name": top_deployment.get("model_deployment_name"),
+            "model_name": top_deployment.get("model_name"),
+            "region": top_deployment.get("region"),
+            "total_tokens": top_deployment.get("total_tokens", 0),
+            "request_count": top_deployment.get("request_count", 0),
+            "token_share_percent": (
+                float(top_deployment.get("total_tokens", 0) or 0) / total_tokens * 100
+                if total_tokens > 0 else None
+            ),
+        }
+
+    return {
+        "average_tokens_per_request": average_tokens_per_request,
+        "top_model": top_model_context,
+        "top_region": top_region_context,
+        "top_deployment": top_deployment_context,
+    }
+
 
 def build_chat_usage_report_data(message: str) -> dict[str, Any]:
-    start_kst, end_kst_exclusive, start_label, end_label = parse_chat_date_range(message)
+    start_kst, end_kst_exclusive, start_label, end_label, date_context = parse_chat_date_range(message)
 
     start_utc = start_kst.astimezone(timezone.utc)
     end_utc = end_kst_exclusive.astimezone(timezone.utc)
@@ -2488,7 +2680,7 @@ def build_chat_usage_report_data(message: str) -> dict[str, Any]:
             end_kst_str=end_label,
             start_time_utc=start_utc,
             end_time_utc=end_utc,
-            reason=f"Chat Agent 비용 조회 실패: {e}",
+            reason=_chat_cost_error_message(e),
         )
 
     return {
@@ -2498,7 +2690,9 @@ def build_chat_usage_report_data(message: str) -> dict[str, Any]:
         "end_date_kst": end_label,
         "start_time_utc": start_utc.isoformat(),
         "end_time_utc": end_utc.isoformat(),
+        "date_context": date_context,
         "metrics": metrics,
+        "analysis": build_chat_analysis_context(metrics),
         "costs": costs,
         "cost_error": costs.get("cost_error"),
     }
@@ -2570,9 +2764,9 @@ def build_chat_daily_compare_data(report_data: dict[str, Any]) -> dict[str, Any]
             end_kst_str=previous_date,
             start_time_utc=previous_start,
             end_time_utc=previous_end,
-            reason=f"이전 날짜 비용 조회 실패: {e}",
+            reason=_chat_cost_error_message(e),
         )
-        cost_errors.append(str(e))
+        cost_errors.append(_chat_cost_error_message(e))
 
     current_costs = report_data["costs"]
     if current_costs.get("cost_error"):
@@ -2642,41 +2836,63 @@ def build_chat_daily_compare_html(report_text: str, compare_data: dict[str, Any]
     return daily_html
 
 
-def generate_chat_usage_summary(report_data: dict[str, Any]) -> str:
+def generate_chat_daily_summary(report_data: dict[str, Any], compare_data: dict[str, Any]) -> str:
+    """단일 날짜 Chat 질의용 대화형 FinOps 분석 문장을 생성합니다."""
     try:
         client = get_azure_openai_client()
         deployment_name = get_env("AZURE_OPENAI_DEPLOYMENT_NAME")
 
-        metrics = report_data["metrics"]
-        costs = report_data["costs"]
-        summary = metrics.get("summary", {})
-        currency = costs.get("currency")
+        previous_day = compare_data["comparison"]["previous_day"]
+        current_day = compare_data["comparison"]["current_day"]
+        token_change = compare_data["comparison"]["summary_change"]["tokens"]
+        cost_change = compare_data["comparison"]["summary_change"]["cost"]
+        prev_costs = previous_day["costs"]
+        curr_costs = current_day["costs"]
+        currency = curr_costs.get("currency") or prev_costs.get("currency") or "KRW"
 
         lightweight_data = {
-            "period_kst": report_data["period_kst"],
-            "query": report_data["query"],
-            "summary": summary,
-            "cost_total_text": format_cost_text(costs.get("total_cost"), currency),
-            "cost_available": costs.get("cost_data_available", True),
-            "cost_error": costs.get("cost_error"),
-            "top_models": metrics.get("model_summary", [])[:5],
+            "query": report_data.get("query"),
+            "date_context": report_data.get("date_context", {}),
+            "previous_day": {
+                "date_kst": previous_day["date_kst"],
+                "summary": previous_day["metrics"].get("summary", {}),
+                "cost_total_text": format_cost_text(prev_costs.get("total_cost"), currency),
+                "cost_available": prev_costs.get("cost_data_available", True),
+            },
+            "current_day": {
+                "date_kst": current_day["date_kst"],
+                "summary": current_day["metrics"].get("summary", {}),
+                "cost_total_text": format_cost_text(curr_costs.get("total_cost"), currency),
+                "cost_available": curr_costs.get("cost_data_available", True),
+            },
+            "change": {
+                "tokens": token_change,
+                "cost_difference_text": format_cost_text(cost_change.get("difference"), currency),
+                "cost_rate_percent": cost_change.get("rate_percent"),
+            },
+            "analysis": report_data.get("analysis", {}),
+            "cost_error": compare_data.get("cost_error"),
         }
 
         system_prompt = """
-너는 Azure OpenAI 사용량을 분석하는 FinOps Agent다.
-사용자 질의에 대해 지정 기간의 사용량을 간결한 한국어로 요약한다.
+너는 AOAI FinOps Sentinel의 대화형 FinOps Agent다.
+사용자의 질문을 먼저 이해한 뒤, 단일 날짜의 실제 사용량과 전일 대비 변화를 자연스럽게 설명한다.
+단순한 숫자 나열이 아니라 사용 패턴에서 눈에 띄는 점을 짚되, 데이터에 없는 원인이나 추측은 만들지 않는다.
 
 규칙:
-1. 데이터에 근거해서만 말한다.
-2. 5문장 이내로 작성한다.
-3. 기간, 총 토큰, 요청 수, 비용을 포함한다.
-4. 모델별 상위 사용량이 있으면 canonical model 기준으로 언급한다.
-5. 비용은 cost_total_text 값을 그대로 사용한다.
-6. cost_available이 false이면 Cost Management API에서 비용을 일시적으로 조회하지 못했다고 안내하고 토큰/요청 수 중심으로 설명한다.
+1. 첫 문장에서 사용자가 요청한 날짜를 어떻게 해석했는지 자연스럽게 답한다.
+2. 현재일 보정이 있었다면 date_context.adjustment_reason을 반드시 반영한다.
+3. 현재일의 input/output/total tokens, Requests를 설명하고 전일 대비 의미 있는 변화가 있으면 함께 언급한다.
+4. analysis의 top_model, top_region, top_deployment는 실제 값이 있을 때만 사용한다.
+5. 비용은 제공된 cost_total_text와 cost_difference_text를 그대로 사용하고 단위를 임의 변환하지 않는다.
+6. 비용 조회에 실패했다면 cost_error의 취지만 짧게 설명하고 토큰/요청 데이터는 정상 조회되었다고 구분한다.
+7. previous 값이 0이면 증감률을 억지로 계산하거나 '무한대 증가'라고 표현하지 않는다.
+8. 원인 추정, 장애 단정, 비용 절감 효과 추정은 하지 않는다.
+9. 한국어로 6~9문장 정도 작성하고, 읽기 좋게 문장을 나눈다. Markdown 표는 만들지 않는다.
 """
 
         user_prompt = f"""
-다음 데이터를 기반으로 채팅 응답용 사용량 요약을 작성해줘.
+다음 데이터를 바탕으로 사용자의 질문에 직접 답하는 FinOps 분석 응답을 작성해줘.
 
 데이터:
 {json.dumps(lightweight_data, ensure_ascii=False, indent=2)}
@@ -2689,39 +2905,141 @@ def generate_chat_usage_summary(report_data: dict[str, Any]) -> str:
                 {"role": "user", "content": user_prompt},
             ],
             reasoning_effort="none",
-            max_completion_tokens=500,
+            max_completion_tokens=700,
         )
         return add_line_breaks(response.choices[0].message.content.strip())
 
-    except Exception as e:
-        logging.exception("generate_chat_usage_summary failed")
-        summary = report_data["metrics"].get("summary", {})
-        costs = report_data["costs"]
+    except Exception:
+        logging.exception("generate_chat_daily_summary failed")
+        current_summary = compare_data["comparison"]["current_day"]["metrics"].get("summary", {})
+        current_costs = compare_data["comparison"]["current_day"]["costs"]
+        date_context = report_data.get("date_context", {})
+        intro = date_context.get("interpretation") or f"{report_data['start_date_kst']} 사용량을 조회했습니다."
+        if date_context.get("period_adjusted") and date_context.get("adjustment_reason"):
+            intro += f" {date_context['adjustment_reason']}"
         cost_sentence = (
-            f"총 비용은 {format_cost_text(costs.get('total_cost'), costs.get('currency'))}입니다."
-            if costs.get("cost_data_available") is not False
-            else "Cost Management API에서 비용을 일시적으로 조회하지 못했습니다. 토큰/요청 수 기준으로 리포트를 제공합니다."
+            f"총 비용은 {format_cost_text(current_costs.get('total_cost'), current_costs.get('currency'))}입니다."
+            if current_costs.get("cost_data_available") is not False
+            else (current_costs.get("cost_error") or "비용 데이터는 이번 조회에서 확인하지 못했습니다.")
         )
         return (
-            f"{report_data['period_kst']} 기준 Azure OpenAI 사용량입니다.<br>"
-            f"총 토큰은 {format_number(summary.get('total_tokens'))}, "
-            f"입력 토큰은 {format_number(summary.get('prompt_tokens'))}, "
-            f"출력 토큰은 {format_number(summary.get('completion_tokens'))}, "
-            f"요청 수는 {format_number(summary.get('request_count'))}건입니다.<br>"
+            f"{intro}<br>"
+            f"해당 일자의 총 토큰은 {format_number(current_summary.get('total_tokens'))}, "
+            f"입력 토큰은 {format_number(current_summary.get('prompt_tokens'))}, "
+            f"출력 토큰은 {format_number(current_summary.get('completion_tokens'))}, "
+            f"요청 수는 {format_number(current_summary.get('request_count'))}건입니다.<br>"
             f"{cost_sentence}"
         )
 
+
+def generate_chat_usage_summary(report_data: dict[str, Any]) -> str:
+    try:
+        client = get_azure_openai_client()
+        deployment_name = get_env("AZURE_OPENAI_DEPLOYMENT_NAME")
+
+        metrics = report_data["metrics"]
+        costs = report_data["costs"]
+        summary = metrics.get("summary", {})
+        currency = costs.get("currency")
+
+        lightweight_data = {
+            "query": report_data["query"],
+            "date_context": report_data.get("date_context", {}),
+            "period_kst": report_data["period_kst"],
+            "summary": summary,
+            "analysis": report_data.get("analysis", {}),
+            "cost_total_text": format_cost_text(costs.get("total_cost"), currency),
+            "cost_available": costs.get("cost_data_available", True),
+            "cost_error": costs.get("cost_error"),
+            "top_models": metrics.get("model_summary", [])[:5],
+        }
+
+        system_prompt = """
+너는 AOAI FinOps Sentinel의 대화형 FinOps Agent다.
+사용자의 질문을 단순 요약하지 말고, 질문의 날짜 의도를 해석하고 실제 조회 범위를 설명한 뒤 사용 패턴을 자연스럽게 분석한다.
+숫자 계산은 제공된 JSON 값을 신뢰하고, 데이터에 없는 원인이나 추측은 만들지 않는다.
+
+규칙:
+1. 첫 1~2문장에서 사용자의 질문을 어떻게 해석했는지와 실제 조회 기간을 직접 설명한다.
+2. date_context.period_adjusted가 true이면 현재 KST 날짜와 함께 adjustment_reason의 내용을 반드시 알려준다.
+3. 총 input/output/total tokens와 Requests를 핵심 수치로 설명한다.
+4. analysis.average_tokens_per_request가 있으면 필요할 때 요청당 평균 사용량으로 해석한다.
+5. analysis.top_model, top_region, top_deployment가 있으면 가장 눈에 띄는 사용 패턴을 1~3개 짚는다. 점유율은 제공된 값만 사용한다.
+6. 특정 모델/리전 사용량이 높은 이유를 임의로 추측하지 않는다.
+7. 비용은 cost_total_text 값을 그대로 사용하며, KRW 값을 원 단위 정수로 바꾸거나 재해석하지 않는다.
+8. cost_available이 false이면 비용 조회 실패와 토큰/요청 조회 성공을 명확히 구분한다. cost_error가 있으면 사용자 친화적으로 짧게 설명한다.
+9. 사용량이 0이면 억지로 인사이트를 만들지 말고 데이터가 없다고 담백하게 설명한다.
+10. 한국어로 6~9문장 정도 작성하고, 읽기 좋은 자연스러운 대화체로 답한다. Markdown 표나 코드 블록은 만들지 않는다.
+"""
+
+        user_prompt = f"""
+다음 데이터를 기반으로 사용자의 질문에 직접 답하는 FinOps 분석 응답을 작성해줘.
+
+데이터:
+{json.dumps(lightweight_data, ensure_ascii=False, indent=2)}
+"""
+
+        response = client.chat.completions.create(
+            model=deployment_name,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            reasoning_effort="none",
+            max_completion_tokens=700,
+        )
+        return add_line_breaks(response.choices[0].message.content.strip())
+
+    except Exception:
+        logging.exception("generate_chat_usage_summary failed")
+        summary = report_data["metrics"].get("summary", {})
+        costs = report_data["costs"]
+        date_context = report_data.get("date_context", {})
+        intro = date_context.get("interpretation") or f"{report_data['period_kst']} 기간을 조회했습니다."
+        if date_context.get("period_adjusted") and date_context.get("adjustment_reason"):
+            intro += f" {date_context['adjustment_reason']}"
+        cost_sentence = (
+            f"총 비용은 {format_cost_text(costs.get('total_cost'), costs.get('currency'))}입니다."
+            if costs.get("cost_data_available") is not False
+            else (costs.get("cost_error") or "비용 데이터는 이번 조회에서 확인하지 못했습니다.")
+        )
+        analysis = report_data.get("analysis", {})
+        top_model = analysis.get("top_model")
+        insight_sentence = ""
+        if top_model and float(top_model.get("total_tokens", 0) or 0) > 0:
+            insight_sentence = (
+                f" 가장 많이 사용된 모델은 {top_model.get('model_name')}이며 "
+                f"{format_number(top_model.get('total_tokens'))} 토큰을 사용했습니다."
+            )
+        return (
+            f"{intro}<br>"
+            f"실제 조회 기간은 {report_data['period_kst']}이며, 총 토큰은 {format_number(summary.get('total_tokens'))}, "
+            f"입력 토큰은 {format_number(summary.get('prompt_tokens'))}, "
+            f"출력 토큰은 {format_number(summary.get('completion_tokens'))}, "
+            f"요청 수는 {format_number(summary.get('request_count'))}건입니다.<br>"
+            f"{cost_sentence}{insight_sentence}"
+        )
 
 def build_chat_usage_report_html(report_text: str, report_data: dict[str, Any]) -> str:
     metrics = report_data["metrics"]
     costs = report_data["costs"]
     summary = metrics.get("summary", {})
     currency = costs.get("currency")
+    date_context = report_data.get("date_context", {})
 
-    table_style = "border-collapse:collapse; width:100%; max-width:900px; font-size:13px; margin:8px 0 20px;"
-    th_style = "border:1px solid #d1d5db; padding:8px; background:#f3f4f6; white-space:nowrap; text-align:center;"
-    td_style = "border:1px solid #d1d5db; padding:8px; white-space:nowrap;"
+    table_style = "border-collapse:collapse; width:100%; font-size:13px; margin:8px 0 20px; table-layout:auto;"
+    th_style = "border:1px solid #d1d5db; padding:8px; background:#f3f4f6; white-space:normal; text-align:center; overflow-wrap:anywhere;"
+    td_style = "border:1px solid #d1d5db; padding:8px; white-space:normal; overflow-wrap:anywhere; word-break:break-word;"
     td_right = "border:1px solid #d1d5db; padding:8px; text-align:right; white-space:nowrap;"
+
+    period_notice = ""
+    if date_context.get("period_adjusted") and date_context.get("adjustment_reason"):
+        period_notice = f"""
+        <div class="chat-period-notice">
+          <strong>조회 범위 안내</strong><br>
+          {date_context.get("adjustment_reason")}
+        </div>
+        """
 
     model_rows = ""
     for item in metrics.get("model_summary", []):
@@ -2729,7 +3047,7 @@ def build_chat_usage_report_html(report_text: str, report_data: dict[str, Any]) 
         <tr>
           <td style="{td_style}">{item.get("model_name", "-")}</td>
           <td style="{td_style}">{", ".join(item.get("regions", []))}</td>
-          <td style="{td_style}">{", ".join(item.get("deployments", []))}</td>
+          <td style="{td_style}" class="deployment-name-cell">{", ".join(item.get("deployments", []))}</td>
           <td style="{td_right}">{format_number(item.get("prompt_tokens"))}</td>
           <td style="{td_right}">{format_number(item.get("completion_tokens"))}</td>
           <td style="{td_right}">{format_number(item.get("total_tokens"))}</td>
@@ -2750,7 +3068,7 @@ def build_chat_usage_report_html(report_text: str, report_data: dict[str, Any]) 
         <tr>
           <td style="{td_style}">{item.get("region", "-")}</td>
           <td style="{td_style}">{item.get("model_name", "-")}</td>
-          <td style="{td_style}">{item.get("model_deployment_name", "-")}</td>
+          <td style="{td_style}" class="deployment-name-cell">{item.get("model_deployment_name", "-")}</td>
           <td style="{td_right}">{format_number(item.get("prompt_tokens"))}</td>
           <td style="{td_right}">{format_number(item.get("completion_tokens"))}</td>
           <td style="{td_right}">{format_number(item.get("total_tokens"))}</td>
@@ -2766,59 +3084,65 @@ def build_chat_usage_report_html(report_text: str, report_data: dict[str, Any]) 
         """
 
     html = f"""
-    <div style="font-family:Arial, sans-serif; color:#111827; line-height:1.5;">
+    <div class="chat-report" style="font-family:Arial, sans-serif; color:#111827; line-height:1.5; max-width:100%;">
       <h2 style="margin:0 0 12px;">AOAI FinOps Sentinel 질의형 사용량 리포트</h2>
-      <p style="margin:0 0 20px; color:#374151;">조회 기간: {report_data["period_kst"]} (KST)</p>
+      <p style="margin:0 0 12px; color:#374151;">조회 기간: {report_data["period_kst"]} (KST)</p>
+      {period_notice}
 
-      <h3 style="margin:24px 0 8px;">요약</h3>
-      <div style="background:#f3f4f6; border-radius:8px; padding:14px; max-width:900px; margin-bottom:20px;">
+      <h3 style="margin:24px 0 8px;">분석 답변</h3>
+      <div class="chat-report-summary" style="background:#f3f4f6; border-radius:8px; padding:14px; max-width:100%; margin-bottom:20px; white-space:pre-wrap; overflow-wrap:anywhere;">
         {report_text}
       </div>
 
       <h3 style="margin:24px 0 8px;">사용량 요약</h3>
-      <table style="border-collapse:collapse; width:100%; max-width:700px; font-size:13px; margin:8px 0 20px;">
-        <tr>
-          <th style="{th_style}">항목</th>
-          <th style="{th_style}">값</th>
-        </tr>
-        <tr><td style="{td_style}">Input Tokens</td><td style="{td_right}">{format_number(summary.get("prompt_tokens"))}</td></tr>
-        <tr><td style="{td_style}">Output Tokens</td><td style="{td_right}">{format_number(summary.get("completion_tokens"))}</td></tr>
-        <tr><td style="{td_style}">Total Tokens</td><td style="{td_right}">{format_number(summary.get("total_tokens"))}</td></tr>
-        <tr><td style="{td_style}">Requests</td><td style="{td_right}">{format_number(summary.get("request_count"))}</td></tr>
-        <tr><td style="{td_style}">Total Cost</td><td style="{td_right}">{format_cost_text(costs.get("total_cost"), currency)}</td></tr>
-      </table>
+      <div class="chat-table-scroll">
+        <table class="chat-report-table chat-report-summary-table" style="{table_style}">
+          <tr>
+            <th style="{th_style}">항목</th>
+            <th style="{th_style}">값</th>
+          </tr>
+          <tr><td style="{td_style}">Input Tokens</td><td style="{td_right}">{format_number(summary.get("prompt_tokens"))}</td></tr>
+          <tr><td style="{td_style}">Output Tokens</td><td style="{td_right}">{format_number(summary.get("completion_tokens"))}</td></tr>
+          <tr><td style="{td_style}">Total Tokens</td><td style="{td_right}">{format_number(summary.get("total_tokens"))}</td></tr>
+          <tr><td style="{td_style}">Requests</td><td style="{td_right}">{format_number(summary.get("request_count"))}</td></tr>
+          <tr><td style="{td_style}">Total Cost</td><td style="{td_right}">{format_cost_text(costs.get("total_cost"), currency)}</td></tr>
+        </table>
+      </div>
 
       <h3 style="margin:24px 0 8px;">모델별 사용량</h3>
-      <table style="{table_style}">
-        <tr>
-          <th style="{th_style}">모델명</th>
-          <th style="{th_style}">리전</th>
-          <th style="{th_style}">포함된 배포명</th>
-          <th style="{th_style}">Input Tokens</th>
-          <th style="{th_style}">Output Tokens</th>
-          <th style="{th_style}">Total Tokens</th>
-          <th style="{th_style}">Requests</th>
-        </tr>
-        {model_rows}
-      </table>
+      <div class="chat-table-scroll">
+        <table class="chat-report-table chat-report-table-wide" style="{table_style}">
+          <tr>
+            <th style="{th_style}">모델명</th>
+            <th style="{th_style}">리전</th>
+            <th style="{th_style}">포함된 배포명</th>
+            <th style="{th_style}">Input Tokens</th>
+            <th style="{th_style}">Output Tokens</th>
+            <th style="{th_style}">Total Tokens</th>
+            <th style="{th_style}">Requests</th>
+          </tr>
+          {model_rows}
+        </table>
+      </div>
 
       <h3 style="margin:24px 0 8px;">리전/배포별 사용량</h3>
-      <table style="{table_style}">
-        <tr>
-          <th style="{th_style}">리전</th>
-          <th style="{th_style}">모델명</th>
-          <th style="{th_style}">배포명</th>
-          <th style="{th_style}">Input Tokens</th>
-          <th style="{th_style}">Output Tokens</th>
-          <th style="{th_style}">Total Tokens</th>
-          <th style="{th_style}">Requests</th>
-        </tr>
-        {deployment_rows}
-      </table>
+      <div class="chat-table-scroll">
+        <table class="chat-report-table chat-report-table-wide" style="{table_style}">
+          <tr>
+            <th style="{th_style}">리전</th>
+            <th style="{th_style}">모델명</th>
+            <th style="{th_style}">배포명</th>
+            <th style="{th_style}">Input Tokens</th>
+            <th style="{th_style}">Output Tokens</th>
+            <th style="{th_style}">Total Tokens</th>
+            <th style="{th_style}">Requests</th>
+          </tr>
+          {deployment_rows}
+        </table>
+      </div>
     </div>
     """
     return html
-
 
 @app.route(route="chat_query", methods=["POST"], auth_level=func.AuthLevel.ANONYMOUS)
 def chat_query(req: func.HttpRequest) -> func.HttpResponse:
@@ -2867,7 +3191,7 @@ def chat_query(req: func.HttpRequest) -> func.HttpResponse:
             return func.HttpResponse(
                 json.dumps({
                     "status": "error",
-                    "answer": "질문 내용이 비어 있습니다. 예: '4월 1일부터 4월 5일까지 사용량 알려줘'",
+                    "answer": "질문 내용이 비어 있습니다. 예: '8월 사용량 알려줘', '이번 달 사용량 알려줘', 또는 '4월 1일부터 4월 5일까지 사용량 알려줘'",
                     "answer_html": "<p>질문 내용이 비어 있습니다.</p>",
                 }, ensure_ascii=False),
                 status_code=400,
@@ -2878,7 +3202,7 @@ def chat_query(req: func.HttpRequest) -> func.HttpResponse:
 
         if is_single_day_report(report_data):
             compare_data = build_chat_daily_compare_data(report_data)
-            report_text = generate_report_text(compare_data)
+            report_text = generate_chat_daily_summary(report_data, compare_data)
             report_html = build_chat_daily_compare_html(report_text, compare_data)
             subject = f"[AOAI FinOps Sentinel] 질의형 일일 사용량 리포트 - {report_data['start_date_kst']}"
             response_report_data = {
