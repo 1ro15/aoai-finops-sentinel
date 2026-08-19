@@ -3090,9 +3090,7 @@ def build_chat_usage_report_html(report_text: str, report_data: dict[str, Any]) 
       {period_notice}
 
       <h3 style="margin:24px 0 8px;">분석 답변</h3>
-      <div class="chat-report-summary" style="background:#f3f4f6; border-radius:8px; padding:14px; max-width:100%; margin-bottom:20px; white-space:pre-wrap; overflow-wrap:anywhere;">
-        {report_text}
-      </div>
+      <div class="chat-report-summary" style="background:#f3f4f6; border-radius:8px; padding:14px; max-width:100%; margin-bottom:20px; white-space:pre-wrap; overflow-wrap:anywhere;">{report_text}</div>
 
       <h3 style="margin:24px 0 8px;">사용량 요약</h3>
       <div class="chat-table-scroll">

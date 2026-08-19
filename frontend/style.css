@@ -50,6 +50,8 @@ h1 {
 .message.user {
   background: #dbeafe;
   margin-left: auto;
+  width: fit-content;
+  text-align: right;
 }
 
 .message.bot {
