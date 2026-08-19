@@ -215,6 +215,8 @@ def query_metric_split_by_deployment(
     start_time_utc: datetime,
     end_time_utc: datetime,
     deployment_model_map: dict[str, str],
+    interval: str = "P1D",
+    include_windows_utc: list[tuple[datetime, datetime]] | None = None,
 ) -> list[dict[str, Any]]:
     token = get_azure_management_token(credential)
     url = f"https://management.azure.com{resource_id}/providers/microsoft.insights/metrics"
@@ -224,7 +226,7 @@ def query_metric_split_by_deployment(
             "api-version": "2018-01-01",
             "metricnames": metric_name,
             "timespan": f"{to_utc_z(start_time_utc)}/{to_utc_z(end_time_utc)}",
-            "interval": "P1D",
+            "interval": interval,
             "aggregation": "Total",
         }
         if filter_expr:
@@ -264,6 +266,18 @@ def query_metric_split_by_deployment(
 
             total_value = 0
             for point in ts.get("data", []) or []:
+                if include_windows_utc:
+                    timestamp_text = point.get("timeStamp") or point.get("timestamp")
+                    if not timestamp_text:
+                        continue
+                    try:
+                        point_time = datetime.fromisoformat(str(timestamp_text).replace("Z", "+00:00")).astimezone(timezone.utc)
+                    except Exception:
+                        logging.warning("Metrics point timestamp parse failed: %s", timestamp_text)
+                        continue
+                    if not any(window_start <= point_time < window_end for window_start, window_end in include_windows_utc):
+                        continue
+
                 point_total = point.get("total")
                 if point_total is not None:
                     total_value += point_total
@@ -294,6 +308,8 @@ def query_all_metrics_for_resource(
     start_time_utc: datetime,
     end_time_utc: datetime,
     deployment_model_map: dict[str, str],
+    interval: str = "P1D",
+    include_windows_utc: list[tuple[datetime, datetime]] | None = None,
 ) -> list[dict[str, Any]]:
     metric_names = [
         "ProcessedPromptTokens",
@@ -312,6 +328,8 @@ def query_all_metrics_for_resource(
             start_time_utc=start_time_utc,
             end_time_utc=end_time_utc,
             deployment_model_map=deployment_model_map,
+            interval=interval,
+            include_windows_utc=include_windows_utc,
         )
 
         for row in metric_rows:
@@ -1684,6 +1702,8 @@ def fetch_metrics_for_custom_range(
     start_time_utc: datetime,
     end_time_utc: datetime,
     deployment_model_map: dict[str, str],
+    interval: str = "P1D",
+    include_windows_utc: list[tuple[datetime, datetime]] | None = None,
 ) -> dict[str, Any]:
     all_rows: list[dict[str, Any]] = []
 
@@ -1694,6 +1714,8 @@ def fetch_metrics_for_custom_range(
             start_time_utc=start_time_utc,
             end_time_utc=end_time_utc,
             deployment_model_map=deployment_model_map,
+            interval=interval,
+            include_windows_utc=include_windows_utc,
         )
         all_rows.extend(rows)
 
@@ -2294,6 +2316,327 @@ def _get_month_bounds_kst(year: int, month: int) -> tuple[datetime, datetime]:
     return start, next_month - timedelta(days=1)
 
 
+
+def _parse_chat_time_value(token: dict[str, Any], inherited_meridiem: str | None = None) -> tuple[int, int, str | None]:
+    """오전/오후 또는 24시간 표기의 시간 토큰을 24시간제 hour/minute로 변환합니다."""
+    raw_hour = int(token["hour"])
+    minute = int(token.get("minute") or 0)
+    meridiem = token.get("meridiem") or inherited_meridiem
+
+    if minute < 0 or minute > 59:
+        raise ValueError("분(minute)은 0~59 범위로 입력해주세요.")
+
+    if meridiem:
+        if raw_hour < 1 or raw_hour > 12:
+            raise ValueError("오전/오후 표기에서는 시간을 1~12시 범위로 입력해주세요.")
+        if meridiem == "오전":
+            hour = 0 if raw_hour == 12 else raw_hour
+        else:
+            hour = 12 if raw_hour == 12 else raw_hour + 12
+    else:
+        if raw_hour < 0 or raw_hour > 23:
+            raise ValueError("24시간 표기에서는 시간을 0~23시 범위로 입력해주세요.")
+        hour = raw_hour
+
+    return hour, minute, meridiem
+
+
+def _extract_chat_time_tokens(text: str) -> list[dict[str, Any]]:
+    """'오후 2시', '14시', '14:30' 형태의 시간 표현을 위치 정보와 함께 추출합니다."""
+    pattern = re.compile(
+        r"(?:(?P<meridiem>오전|오후)\s*)?"
+        r"(?P<hour>\d{1,2})"
+        r"(?:"
+        r":(?P<minute_colon>\d{2})"
+        r"|\s*시(?:\s*(?P<minute_korean>\d{1,2})\s*분?)?"
+        r")"
+    )
+
+    tokens: list[dict[str, Any]] = []
+    for match in pattern.finditer(text):
+        minute = match.group("minute_colon") or match.group("minute_korean") or "0"
+        tokens.append({
+            "start": match.start(),
+            "end": match.end(),
+            "raw": match.group(0),
+            "meridiem": match.group("meridiem"),
+            "hour": int(match.group("hour")),
+            "minute": int(minute),
+        })
+    return tokens
+
+
+def _extract_chat_date_tokens(text: str, now_kst: datetime) -> list[dict[str, Any]]:
+    """시간 질의에서 날짜 표현을 순서대로 추출합니다. 두 번째 '16일'은 앞 날짜의 연/월을 상속합니다."""
+    tokens: list[dict[str, Any]] = []
+    occupied: list[tuple[int, int]] = []
+
+    def overlaps(start: int, end: int) -> bool:
+        return any(not (end <= s or start >= e) for s, e in occupied)
+
+    def add_token(start: int, end: int, value: datetime, raw: str) -> None:
+        if overlaps(start, end):
+            return
+        tokens.append({"start": start, "end": end, "date": value, "raw": raw})
+        occupied.append((start, end))
+
+    # 구체적인 날짜 형식을 먼저 처리해 중복 매칭을 방지합니다.
+    for match in re.finditer(r"(20\d{2})[-./](\d{1,2})[-./](\d{1,2})", text):
+        y, m, d = map(int, match.groups())
+        try:
+            value = datetime(y, m, d, 0, 0, 0, tzinfo=KST)
+        except ValueError as e:
+            raise ValueError(f"유효하지 않은 날짜가 포함되어 있습니다: {e}") from e
+        add_token(match.start(), match.end(), value, match.group(0))
+
+    for match in re.finditer(r"(20\d{2})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일", text):
+        y, m, d = map(int, match.groups())
+        try:
+            value = datetime(y, m, d, 0, 0, 0, tzinfo=KST)
+        except ValueError as e:
+            raise ValueError(f"유효하지 않은 날짜가 포함되어 있습니다: {e}") from e
+        add_token(match.start(), match.end(), value, match.group(0))
+
+    for match in re.finditer(r"(\d{1,2})\s*월\s*(\d{1,2})\s*일", text):
+        m, d = map(int, match.groups())
+        try:
+            value = datetime(now_kst.year, m, d, 0, 0, 0, tzinfo=KST)
+        except ValueError as e:
+            raise ValueError(f"유효하지 않은 날짜가 포함되어 있습니다: {e}") from e
+        add_token(match.start(), match.end(), value, match.group(0))
+
+    for match in re.finditer(r"오늘|어제", text):
+        if match.group(0) == "오늘":
+            value = datetime(now_kst.year, now_kst.month, now_kst.day, 0, 0, 0, tzinfo=KST)
+        else:
+            base = datetime(now_kst.year, now_kst.month, now_kst.day, 0, 0, 0, tzinfo=KST)
+            value = base - timedelta(days=1)
+        add_token(match.start(), match.end(), value, match.group(0))
+
+    tokens.sort(key=lambda x: x["start"])
+
+    # '8월 13일 ... 16일 ...'처럼 두 번째 날짜가 일(day)만 있는 표현을 보완합니다.
+    for match in re.finditer(r"(\d{1,2})\s*일", text):
+        if overlaps(match.start(), match.end()):
+            continue
+
+        previous = None
+        for token in tokens:
+            if token["end"] <= match.start():
+                previous = token
+            else:
+                break
+        if previous is None:
+            continue
+
+        day = int(match.group(1))
+        base_date = previous["date"]
+        try:
+            value = datetime(base_date.year, base_date.month, day, 0, 0, 0, tzinfo=KST)
+        except ValueError as e:
+            raise ValueError(f"유효하지 않은 날짜가 포함되어 있습니다: {e}") from e
+        add_token(match.start(), match.end(), value, match.group(0))
+        tokens.sort(key=lambda x: x["start"])
+
+    return tokens
+
+
+def parse_chat_time_range(message: str) -> tuple[datetime, datetime, str, str, dict[str, Any]] | None:
+    """
+    시간 표현이 명시된 Chat 질의를 파싱합니다.
+
+    지원 예:
+    - 8월 13일 오후 2시부터 4시까지
+    - 8월 13일 14:00부터 16:00까지
+    - 8월 13일 오후 2시부터 16일 오후 2시까지
+    - 8월 13일부터 16일까지 9시 ~ 15시
+    - 8월 13일부터 16일까지 오전 9시부터 오후 3시까지
+    - 오늘 14시부터 16시까지 / 어제 오후 1시부터 5시까지
+
+    반환되는 end datetime은 조회 종료 경계(exclusive)로 사용합니다.
+    """
+    now_kst = datetime.now(KST)
+    text = re.sub(r"\s+", " ", message.strip())
+    time_tokens = _extract_chat_time_tokens(text)
+
+    if len(time_tokens) < 2:
+        return None
+
+    date_tokens = _extract_chat_date_tokens(text, now_kst)
+    if not date_tokens:
+        return None
+
+    first_time = time_tokens[0]
+    second_time = time_tokens[1]
+    start_hour, start_minute, start_meridiem = _parse_chat_time_value(first_time)
+    end_hour, end_minute, _ = _parse_chat_time_value(second_time, inherited_meridiem=start_meridiem)
+
+    first_date = date_tokens[0]["date"]
+    query_mode = "continuous"
+
+    if len(date_tokens) >= 2 and date_tokens[1]["end"] <= first_time["start"]:
+        # 예: '8월 13일부터 16일까지 9시 ~ 15시' -> 날짜별 반복 시간대
+        query_mode = "daily_time_window"
+        last_date = date_tokens[1]["date"]
+
+        if last_date < first_date:
+            raise ValueError("종료일이 시작일보다 빠릅니다. 조회 기간을 다시 확인해주세요.")
+        if (last_date.date() - first_date.date()).days + 1 > 90:
+            raise ValueError("한 번에 조회 가능한 기간은 최대 90일입니다. 기간을 나누어 요청해주세요.")
+
+        requested_windows: list[tuple[datetime, datetime]] = []
+        cursor = first_date
+        while cursor.date() <= last_date.date():
+            window_start = cursor.replace(hour=start_hour, minute=start_minute)
+            window_end = cursor.replace(hour=end_hour, minute=end_minute)
+            if window_end <= window_start:
+                raise ValueError("반복 시간대의 종료 시간이 시작 시간보다 빠르거나 같습니다. 현재 버전에서는 같은 날짜 안의 시간대를 지정해주세요.")
+            requested_windows.append((window_start, window_end))
+            cursor += timedelta(days=1)
+
+        requested_start = requested_windows[0][0]
+        requested_end = requested_windows[-1][1]
+        interpretation = (
+            f"요청하신 기간을 {first_date.strftime('%Y-%m-%d')}부터 {last_date.strftime('%Y-%m-%d')}까지, "
+            f"매일 {requested_windows[0][0].strftime('%H:%M')}~{requested_windows[0][1].strftime('%H:%M')} 시간대로 해석했습니다."
+        )
+    else:
+        # 날짜가 하나면 같은 날의 연속 시간 범위, 날짜가 둘이면 시작/종료 datetime 범위입니다.
+        last_date = date_tokens[1]["date"] if len(date_tokens) >= 2 else first_date
+        requested_start = first_date.replace(hour=start_hour, minute=start_minute)
+        requested_end = last_date.replace(hour=end_hour, minute=end_minute)
+        if requested_end <= requested_start:
+            raise ValueError("종료 시간이 시작 시간보다 빠르거나 같습니다. 시간 범위를 다시 확인해주세요.")
+        if (requested_end.date() - requested_start.date()).days + 1 > 90:
+            raise ValueError("한 번에 조회 가능한 기간은 최대 90일입니다. 기간을 나누어 요청해주세요.")
+        requested_windows = [(requested_start, requested_end)]
+        interpretation = (
+            f"요청하신 시간 범위를 KST 기준 {requested_start.strftime('%Y-%m-%d %H:%M')}부터 "
+            f"{requested_end.strftime('%Y-%m-%d %H:%M')}까지로 해석했습니다."
+        )
+
+    oldest_allowed = now_kst - timedelta(days=90)
+    if requested_start < oldest_allowed:
+        raise ValueError(
+            f"Azure Monitor 메트릭은 최근 90일 이내 기간만 조회하도록 제한했습니다. "
+            f"조회 시작 시각({requested_start.strftime('%Y-%m-%d %H:%M')})을 최근 90일 이내로 지정해주세요."
+        )
+
+    if requested_start >= now_kst:
+        raise ValueError(
+            f"미래 시간은 조회할 수 없습니다. 현재 KST 시각은 {now_kst.strftime('%Y-%m-%d %H:%M')}입니다."
+        )
+
+    actual_windows: list[tuple[datetime, datetime]] = []
+    adjusted = False
+    for window_start, window_end in requested_windows:
+        if window_start >= now_kst:
+            adjusted = True
+            continue
+        actual_end = min(window_end, now_kst)
+        if actual_end < window_end:
+            adjusted = True
+        if actual_end > window_start:
+            actual_windows.append((window_start, actual_end))
+
+    if not actual_windows:
+        raise ValueError(
+            f"요청하신 시간대가 아직 도달하지 않은 미래 구간입니다. 현재 KST 시각은 {now_kst.strftime('%Y-%m-%d %H:%M')}입니다."
+        )
+
+    actual_start = actual_windows[0][0]
+    actual_end = actual_windows[-1][1]
+
+    if query_mode == "daily_time_window":
+        requested_period_text = (
+            f"{first_date.strftime('%Y-%m-%d')} ~ {last_date.strftime('%Y-%m-%d')} / "
+            f"매일 {requested_windows[0][0].strftime('%H:%M')} ~ {requested_windows[0][1].strftime('%H:%M')}"
+        )
+
+        actual_dates = sorted({w[0].strftime('%Y-%m-%d') for w in actual_windows})
+        requested_daily_start = requested_windows[0][0].strftime("%H:%M")
+        requested_daily_end = requested_windows[0][1].strftime("%H:%M")
+
+        last_actual_window = actual_windows[-1]
+        last_actual_start = last_actual_window[0]
+        last_actual_end = last_actual_window[1]
+        requested_last_end = last_actual_start.replace(
+            hour=requested_windows[0][1].hour,
+            minute=requested_windows[0][1].minute,
+            second=0,
+            microsecond=0,
+        )
+
+        # 마지막 조회일이 현재 시각 때문에 요청 종료시각보다 먼저 잘린 경우를 표시합니다.
+        last_window_is_partial = last_actual_end < requested_last_end
+
+        if last_window_is_partial:
+            actual_period_text = (
+                f"{actual_dates[0]} ~ {actual_dates[-1]} / "
+                f"매일 {requested_daily_start} ~ {requested_daily_end}, "
+                f"단 {actual_dates[-1]}은 {last_actual_end.strftime('%H:%M')}까지"
+            )
+        else:
+            actual_period_text = (
+                f"{actual_dates[0]} ~ {actual_dates[-1]} / "
+                f"매일 {requested_daily_start} ~ {requested_daily_end}"
+            )
+    else:
+        requested_period_text = f"{requested_start.strftime('%Y-%m-%d %H:%M')} ~ {requested_end.strftime('%Y-%m-%d %H:%M')}"
+        actual_period_text = f"{actual_start.strftime('%Y-%m-%d %H:%M')} ~ {actual_end.strftime('%Y-%m-%d %H:%M')}"
+
+    adjustment_reason = None
+    if adjusted:
+        adjustment_reason = (
+            f"요청 범위에 현재 KST 시각({now_kst.strftime('%Y-%m-%d %H:%M')}) 이후 구간이 포함되어 있어 "
+            f"도달한 시각까지만 조회했습니다. 실제 조회 범위는 {actual_period_text}입니다."
+        )
+
+    date_context = {
+        "expression_type": "time_range",
+        "has_time_filter": True,
+        "time_query_mode": query_mode,
+        "metric_interval": "PT1H",
+        "interpretation": interpretation,
+        "now_kst": now_kst.strftime("%Y-%m-%d %H:%M"),
+        "requested_period_text": requested_period_text,
+        "actual_period_text": actual_period_text,
+        "requested_start_datetime_kst": requested_start.isoformat(),
+        "requested_end_datetime_kst": requested_end.isoformat(),
+        "actual_start_datetime_kst": actual_start.isoformat(),
+        "actual_end_datetime_kst": actual_end.isoformat(),
+        "requested_start_date_kst": requested_start.strftime("%Y-%m-%d"),
+        "requested_end_date_kst": requested_end.strftime("%Y-%m-%d"),
+        "actual_start_date_kst": actual_start.strftime("%Y-%m-%d"),
+        "actual_end_date_kst": actual_end.strftime("%Y-%m-%d"),
+        "period_adjusted": adjusted,
+        "adjustment_reason": adjustment_reason,
+        "query_windows_kst": [
+            {"start": start.isoformat(), "end": end.isoformat()}
+            for start, end in actual_windows
+        ],
+        "cost_granularity_note": (
+            "Cost Management API 비용 데이터는 현재 일 단위 집계를 사용하므로 시간대별 정확한 비용은 이 조회에 포함하지 않습니다."
+        ),
+    }
+
+    return (
+        actual_start,
+        actual_end,
+        actual_start.strftime("%Y-%m-%d"),
+        actual_end.strftime("%Y-%m-%d"),
+        date_context,
+    )
+
+
+def parse_chat_query_range(message: str) -> tuple[datetime, datetime, str, str, dict[str, Any]]:
+    """시간 표현이 있으면 시간 파서를 우선 사용하고, 아니면 기존 날짜 파서를 그대로 사용합니다."""
+    time_result = parse_chat_time_range(message)
+    if time_result is not None:
+        return time_result
+    return parse_chat_date_range(message)
+
+
 def parse_chat_date_range(message: str) -> tuple[datetime, datetime, str, str, dict[str, Any]]:
     """
     사용자의 한국어/숫자형 날짜 표현을 KST 기준 시작/종료 일자로 변환합니다.
@@ -2566,6 +2909,21 @@ def build_chat_analysis_context(metrics: dict[str, Any]) -> dict[str, Any]:
     total_tokens = float(summary.get("total_tokens", 0) or 0)
     request_count = float(summary.get("request_count", 0) or 0)
 
+    # 실제 사용량과 요청이 모두 0이면 Top 모델/리전/배포를 임의로 선정하지 않습니다.
+    if total_tokens <= 0 and request_count <= 0:
+        return {
+            "average_tokens_per_request": None,
+            "top_model": None,
+            "top_region": None,
+            "top_deployment": None,
+        }
+
+    def percentage(part: float, total: float) -> float | None:
+        """사용자에게 전달할 점유율은 소수점 둘째 자리까지 반올림합니다."""
+        if total <= 0:
+            return None
+        return round((part / total) * 100, 2)
+
     average_tokens_per_request = None
     if request_count > 0:
         average_tokens_per_request = total_tokens / request_count
@@ -2581,7 +2939,7 @@ def build_chat_analysis_context(metrics: dict[str, Any]) -> dict[str, Any]:
             "request_count": top_model.get("request_count", 0),
             "regions": top_model.get("regions", []),
             "deployments": top_model.get("deployments", []),
-            "token_share_percent": (model_tokens / total_tokens * 100) if total_tokens > 0 else None,
+            "token_share_percent": percentage(model_tokens, total_tokens),
         }
 
     region_map: dict[str, dict[str, float]] = {}
@@ -2602,10 +2960,7 @@ def build_chat_analysis_context(metrics: dict[str, Any]) -> dict[str, Any]:
             "region": top_region_name,
             "total_tokens": top_region_values["total_tokens"],
             "request_count": top_region_values["request_count"],
-            "token_share_percent": (
-                top_region_values["total_tokens"] / total_tokens * 100
-                if total_tokens > 0 else None
-            ),
+            "token_share_percent": percentage(top_region_values["total_tokens"], total_tokens),
         }
 
     deployment_items = metrics.get("items", []) or []
@@ -2621,9 +2976,9 @@ def build_chat_analysis_context(metrics: dict[str, Any]) -> dict[str, Any]:
             "region": top_deployment.get("region"),
             "total_tokens": top_deployment.get("total_tokens", 0),
             "request_count": top_deployment.get("request_count", 0),
-            "token_share_percent": (
-                float(top_deployment.get("total_tokens", 0) or 0) / total_tokens * 100
-                if total_tokens > 0 else None
+            "token_share_percent": percentage(
+                float(top_deployment.get("total_tokens", 0) or 0),
+                total_tokens,
             ),
         }
 
@@ -2635,8 +2990,63 @@ def build_chat_analysis_context(metrics: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+
+def _fetch_chat_metrics(
+    credential: DefaultAzureCredential,
+    resources: list[dict[str, str]],
+    deployment_model_map: dict[str, str],
+    start_utc: datetime,
+    end_utc: datetime,
+    date_context: dict[str, Any],
+) -> dict[str, Any]:
+    """Chat 시간 질의는 PT1H로 조회하고, 반복 시간대는 timestamp 기준으로 필요한 시간창만 합산합니다."""
+    has_time_filter = bool(date_context.get("has_time_filter"))
+    query_mode = date_context.get("time_query_mode")
+
+    if not has_time_filter:
+        return fetch_metrics_for_custom_range(
+            credential=credential,
+            resources=resources,
+            start_time_utc=start_utc,
+            end_time_utc=end_utc,
+            deployment_model_map=deployment_model_map,
+        )
+
+    interval = str(date_context.get("metric_interval") or "PT1H")
+    include_windows_utc = None
+
+    if query_mode == "daily_time_window":
+        include_windows_utc = []
+        for window in date_context.get("query_windows_kst", []) or []:
+            window_start_kst = datetime.fromisoformat(window["start"])
+            window_end_kst = datetime.fromisoformat(window["end"])
+            include_windows_utc.append((
+                window_start_kst.astimezone(timezone.utc),
+                window_end_kst.astimezone(timezone.utc),
+            ))
+
+    result = fetch_metrics_for_custom_range(
+        credential=credential,
+        resources=resources,
+        start_time_utc=start_utc,
+        end_time_utc=end_utc,
+        deployment_model_map=deployment_model_map,
+        interval=interval,
+        include_windows_utc=include_windows_utc,
+    )
+    result["metric_interval"] = interval
+    result["time_window_count"] = len(include_windows_utc or []) or 1
+    return result
+
+
+def _build_chat_period_label(date_context: dict[str, Any], start_label: str, end_label: str) -> str:
+    if date_context.get("has_time_filter"):
+        return str(date_context.get("actual_period_text") or f"{start_label} ~ {end_label}")
+    return f"{start_label} ~ {end_label}"
+
+
 def build_chat_usage_report_data(message: str) -> dict[str, Any]:
-    start_kst, end_kst_exclusive, start_label, end_label, date_context = parse_chat_date_range(message)
+    start_kst, end_kst_exclusive, start_label, end_label, date_context = parse_chat_query_range(message)
 
     start_utc = start_kst.astimezone(timezone.utc)
     end_utc = end_kst_exclusive.astimezone(timezone.utc)
@@ -2647,41 +3057,52 @@ def build_chat_usage_report_data(message: str) -> dict[str, Any]:
     subscription_id = get_env("SUBSCRIPTION_ID")
     resource_ids = [resource["resource_id"] for resource in resources]
 
-    metrics = fetch_metrics_for_custom_range(
+    metrics = _fetch_chat_metrics(
         credential=credential,
         resources=resources,
-        start_time_utc=start_utc,
-        end_time_utc=end_utc,
         deployment_model_map=deployment_model_map,
+        start_utc=start_utc,
+        end_utc=end_utc,
+        date_context=date_context,
     )
 
     # Chat Agent에서도 비용을 실제 조회합니다.
     # 단, 대화형 응답이 장시간 멈추지 않도록 429 발생 시 5초 후 1회만 재시도하고,
     # 끝내 실패하면 비용만 fallback 처리하여 토큰/요청 리포트는 계속 반환합니다.
-    period_label = f"{start_label} ~ {end_label}"
+    period_label = _build_chat_period_label(date_context, start_label, end_label)
 
-    try:
-        costs = fetch_costs_for_custom_range(
-            credential=credential,
-            subscription_id=subscription_id,
-            resource_ids=resource_ids,
-            start_time_utc=start_utc,
-            end_time_utc=end_utc,
-            period_label=period_label,
-            start_kst_str=start_label,
-            end_kst_str=end_label,
-            retry_delays=[5],
-        )
-    except Exception as e:
-        logging.exception("Chat cost data fetch failed")
+    if date_context.get("has_time_filter"):
         costs = build_unavailable_chat_costs(
             period_label=period_label,
             start_kst_str=start_label,
             end_kst_str=end_label,
             start_time_utc=start_utc,
             end_time_utc=end_utc,
-            reason=_chat_cost_error_message(e),
+            reason=str(date_context.get("cost_granularity_note")),
         )
+    else:
+        try:
+            costs = fetch_costs_for_custom_range(
+                credential=credential,
+                subscription_id=subscription_id,
+                resource_ids=resource_ids,
+                start_time_utc=start_utc,
+                end_time_utc=end_utc,
+                period_label=period_label,
+                start_kst_str=start_label,
+                end_kst_str=end_label,
+                retry_delays=[5],
+            )
+        except Exception as e:
+            logging.exception("Chat cost data fetch failed")
+            costs = build_unavailable_chat_costs(
+                period_label=period_label,
+                start_kst_str=start_label,
+                end_kst_str=end_label,
+                start_time_utc=start_utc,
+                end_time_utc=end_utc,
+                reason=_chat_cost_error_message(e),
+            )
 
     return {
         "query": message,
@@ -2698,6 +3119,8 @@ def build_chat_usage_report_data(message: str) -> dict[str, Any]:
     }
 
 def is_single_day_report(report_data: dict[str, Any]) -> bool:
+    if report_data.get("date_context", {}).get("has_time_filter"):
+        return False
     return report_data.get("start_date_kst") == report_data.get("end_date_kst")
 
 
@@ -2836,6 +3259,45 @@ def build_chat_daily_compare_html(report_text: str, compare_data: dict[str, Any]
     return daily_html
 
 
+def _sanitize_chat_agent_text(text: str) -> str:
+    """LLM 응답에 내부 JSON key/변수명이 노출되면 사용자 친화적인 표현으로 정리합니다."""
+    replacements = {
+        "analysis.top_model": "주요 모델",
+        "analysis.top_region": "주요 리전",
+        "analysis.top_deployment": "주요 배포",
+        "analysis.average_tokens_per_request": "요청당 평균 토큰",
+        "date_context.time_query_mode": "시간 조회 방식",
+        "date_context.has_time_filter": "시간 필터 사용 여부",
+        "date_context.adjustment_reason": "조회 범위 조정 안내",
+        "cost_difference_text": "비용 차이",
+        "cost_total_text": "비용",
+        "cost_available": "비용 조회 가능 여부",
+        "cost_error": "비용 조회 안내",
+        "token_share_percent": "토큰 비중",
+        "top_deployment": "주요 배포",
+        "top_region": "주요 리전",
+        "top_model": "주요 모델",
+        "average_tokens_per_request": "요청당 평균 토큰",
+        "time_query_mode": "시간 조회 방식",
+        "time_window_count": "조회 시간대 수",
+        "metric_interval": "메트릭 집계 간격",
+        "request_count": "요청 수",
+        "completion_tokens": "출력 토큰",
+        "prompt_tokens": "입력 토큰",
+        "total_tokens": "총 토큰",
+    }
+
+    sanitized = text or ""
+    for internal_name, friendly_name in replacements.items():
+        sanitized = re.sub(
+            rf"`?{re.escape(internal_name)}`?",
+            friendly_name,
+            sanitized,
+            flags=re.IGNORECASE,
+        )
+    return sanitized
+
+
 def generate_chat_daily_summary(report_data: dict[str, Any], compare_data: dict[str, Any]) -> str:
     """단일 날짜 Chat 질의용 대화형 FinOps 분석 문장을 생성합니다."""
     try:
@@ -2888,7 +3350,8 @@ def generate_chat_daily_summary(report_data: dict[str, Any], compare_data: dict[
 6. 비용 조회에 실패했다면 cost_error의 취지만 짧게 설명하고 토큰/요청 데이터는 정상 조회되었다고 구분한다.
 7. previous 값이 0이면 증감률을 억지로 계산하거나 '무한대 증가'라고 표현하지 않는다.
 8. 원인 추정, 장애 단정, 비용 절감 효과 추정은 하지 않는다.
-9. 한국어로 6~9문장 정도 작성하고, 읽기 좋게 문장을 나눈다. Markdown 표는 만들지 않는다.
+9. JSON key나 Python 변수명 같은 내부 필드명은 사용자 답변에 절대 노출하지 않고, 반드시 자연스러운 한국어 표현으로 바꿔 쓴다.
+10. 한국어로 6~9문장 정도 작성하고, 읽기 좋게 문장을 나눈다. Markdown 표는 만들지 않는다.
 """
 
         user_prompt = f"""
@@ -2907,7 +3370,8 @@ def generate_chat_daily_summary(report_data: dict[str, Any], compare_data: dict[
             reasoning_effort="none",
             max_completion_tokens=700,
         )
-        return add_line_breaks(response.choices[0].message.content.strip())
+        raw_text = response.choices[0].message.content.strip()
+        return add_line_breaks(_sanitize_chat_agent_text(raw_text))
 
     except Exception:
         logging.exception("generate_chat_daily_summary failed")
@@ -2948,6 +3412,8 @@ def generate_chat_usage_summary(report_data: dict[str, Any]) -> str:
             "period_kst": report_data["period_kst"],
             "summary": summary,
             "analysis": report_data.get("analysis", {}),
+            "time_window_count": metrics.get("time_window_count"),
+            "metric_interval": metrics.get("metric_interval"),
             "cost_total_text": format_cost_text(costs.get("total_cost"), currency),
             "cost_available": costs.get("cost_data_available", True),
             "cost_error": costs.get("cost_error"),
@@ -2968,8 +3434,13 @@ def generate_chat_usage_summary(report_data: dict[str, Any]) -> str:
 6. 특정 모델/리전 사용량이 높은 이유를 임의로 추측하지 않는다.
 7. 비용은 cost_total_text 값을 그대로 사용하며, KRW 값을 원 단위 정수로 바꾸거나 재해석하지 않는다.
 8. cost_available이 false이면 비용 조회 실패와 토큰/요청 조회 성공을 명확히 구분한다. cost_error가 있으면 사용자 친화적으로 짧게 설명한다.
-9. 사용량이 0이면 억지로 인사이트를 만들지 말고 데이터가 없다고 담백하게 설명한다.
-10. 한국어로 6~9문장 정도 작성하고, 읽기 좋은 자연스러운 대화체로 답한다. Markdown 표나 코드 블록은 만들지 않는다.
+9. date_context.has_time_filter가 true이면 날짜뿐 아니라 정확한 시간 범위를 첫 부분에서 명시하고, time_query_mode가 daily_time_window이면 '매일 동일 시간대만 합산한 결과'임을 설명한다.
+10. 시간대 조회에서 cost_available이 false이고 cost_error가 비용 granularity 안내라면 장애처럼 표현하지 말고, Cost Management가 일 단위 집계이므로 정확한 시간대 비용을 제외했다고 설명한다.
+11. time_window_count가 2 이상이면 여러 날짜의 동일 시간대를 합산한 결과임을 필요할 때 명확히 한다.
+12. total tokens와 Requests가 모두 0이면 특정 모델, 리전, 배포를 Top 항목으로 언급하지 않고 사용량이 확인되지 않았다고만 설명한다.
+13. JSON key나 Python 변수명 같은 내부 필드명은 사용자 답변에 절대 노출하지 않고, 반드시 자연스러운 한국어 표현으로 바꿔 쓴다.
+14. 시간대 조회에서 비용을 제공하지 않는 경우 '-' 같은 내부 표시값 자체를 설명하지 말고, Cost Management의 일 단위 집계 때문에 정확한 시간대 비용을 제외했다고만 설명한다.
+15. 한국어로 6~9문장 정도 작성하고, 읽기 좋은 자연스러운 대화체로 답한다. Markdown 표나 코드 블록은 만들지 않는다.
 """
 
         user_prompt = f"""
@@ -2988,7 +3459,8 @@ def generate_chat_usage_summary(report_data: dict[str, Any]) -> str:
             reasoning_effort="none",
             max_completion_tokens=700,
         )
-        return add_line_breaks(response.choices[0].message.content.strip())
+        raw_text = response.choices[0].message.content.strip()
+        return add_line_breaks(_sanitize_chat_agent_text(raw_text))
 
     except Exception:
         logging.exception("generate_chat_usage_summary failed")
@@ -3013,7 +3485,7 @@ def generate_chat_usage_summary(report_data: dict[str, Any]) -> str:
             )
         return (
             f"{intro}<br>"
-            f"실제 조회 기간은 {report_data['period_kst']}이며, 총 토큰은 {format_number(summary.get('total_tokens'))}, "
+            f"실제 조회 범위는 {report_data['period_kst']}이며, 총 토큰은 {format_number(summary.get('total_tokens'))}, "
             f"입력 토큰은 {format_number(summary.get('prompt_tokens'))}, "
             f"출력 토큰은 {format_number(summary.get('completion_tokens'))}, "
             f"요청 수는 {format_number(summary.get('request_count'))}건입니다.<br>"
@@ -3026,6 +3498,9 @@ def build_chat_usage_report_html(report_text: str, report_data: dict[str, Any]) 
     summary = metrics.get("summary", {})
     currency = costs.get("currency")
     date_context = report_data.get("date_context", {})
+    cost_display_text = format_cost_text(costs.get("total_cost"), currency)
+    if date_context.get("has_time_filter") and costs.get("cost_data_available") is False:
+        cost_display_text = "시간대별 비용 미제공"
 
     table_style = "border-collapse:collapse; width:100%; font-size:13px; margin:8px 0 20px; table-layout:auto;"
     th_style = "border:1px solid #d1d5db; padding:8px; background:#f3f4f6; white-space:normal; text-align:center; overflow-wrap:anywhere;"
@@ -3103,7 +3578,7 @@ def build_chat_usage_report_html(report_text: str, report_data: dict[str, Any]) 
           <tr><td style="{td_style}">Output Tokens</td><td style="{td_right}">{format_number(summary.get("completion_tokens"))}</td></tr>
           <tr><td style="{td_style}">Total Tokens</td><td style="{td_right}">{format_number(summary.get("total_tokens"))}</td></tr>
           <tr><td style="{td_style}">Requests</td><td style="{td_right}">{format_number(summary.get("request_count"))}</td></tr>
-          <tr><td style="{td_style}">Total Cost</td><td style="{td_right}">{format_cost_text(costs.get("total_cost"), currency)}</td></tr>
+          <tr><td style="{td_style}">Total Cost</td><td style="{td_right}">{cost_display_text}</td></tr>
         </table>
       </div>
 
@@ -3189,7 +3664,7 @@ def chat_query(req: func.HttpRequest) -> func.HttpResponse:
             return func.HttpResponse(
                 json.dumps({
                     "status": "error",
-                    "answer": "질문 내용이 비어 있습니다. 예: '8월 사용량 알려줘', '이번 달 사용량 알려줘', 또는 '4월 1일부터 4월 5일까지 사용량 알려줘'",
+                    "answer": "질문 내용이 비어 있습니다. 예: '8월 사용량 알려줘', '8월 13일 오후 2시부터 4시까지 사용량 알려줘', 또는 '8월 13일부터 16일까지 9시 ~ 15시 사용량 알려줘'",
                     "answer_html": "<p>질문 내용이 비어 있습니다.</p>",
                 }, ensure_ascii=False),
                 status_code=400,
